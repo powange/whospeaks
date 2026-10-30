@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS phrases (
     satellite TEXT,
     transcript TEXT,
     -- identifie | inconnu | trop_court | enrolement | reprise | erreur
+    -- | ignoree_silence | ignoree_hallucination
     resultat TEXT NOT NULL,
     personne_id INTEGER REFERENCES personnes(id) ON DELETE SET NULL,
     score REAL,

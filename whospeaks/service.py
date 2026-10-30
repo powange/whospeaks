@@ -42,7 +42,9 @@ class ServiceError(Exception):
 
 @dataclass
 class Analysis:
-    resultat: str  # identifie | inconnu | trop_court | enrolement | reprise | erreur
+    # identifie | inconnu | trop_court | enrolement | reprise | erreur
+    # | ignoree_silence | ignoree_hallucination (texte non transmis à HA)
+    resultat: str
     duree_parole: float = 0.0
     person_id: int | None = None
     nom: str | None = None
@@ -218,12 +220,19 @@ class WhoSpeaks:
     def analyze(self, pcm: bytes, satellite: str | None = None) -> Analysis:
         """Appelé dans un thread à la fin de chaque phrase (audio 16 kHz mono 16 bits)."""
         audio = pcm16_to_float(pcm)
-        if self.embedder is None or self.vad is None:
+        if self.vad is None:
             return Analysis("erreur", audio=audio, erreur=self.model_error or "modèle non chargé")
         s = self.settings
         t0 = time.perf_counter()
         speech = self.vad.speech(audio)
         duree = len(speech) / SAMPLE_RATE
+        if s["filtre_silence_actif"] and duree < s["silence_max_s"]:
+            # Personne ne parle (faux réveil) : le proxy renverra un texte vide.
+            return Analysis("ignoree_silence", duree_parole=duree, audio=audio,
+                            temps_empreinte_ms=(time.perf_counter() - t0) * 1000)
+        if self.embedder is None:
+            return Analysis("erreur", duree_parole=duree, audio=audio,
+                            erreur=self.model_error or "modèle non chargé")
         enrol = self._active_enrolement()
         if duree < s["duree_min_parole"]:
             # Pendant l'enrôlement aussi : une phrase trop courte n'est pas comptée.
@@ -342,6 +351,14 @@ class WhoSpeaks:
         etat = "ignoree" if analysis.ignoree else "nouvelle"
         if analysis.resultat in ("identifie", "enrolement"):
             etat = "attribuee"
+        detached_cluster = None
+        if analysis.resultat.startswith("ignoree_"):
+            # Texte non transmis : la phrase ne nourrit ni les groupes ni les échantillons.
+            # La personne éventuellement reconnue reste dans la mémoire de reprise :
+            # la voix a bien été identifiée, seul le texte est inventé.
+            etat = "ignoree"
+            detached_cluster, analysis.cluster_id = analysis.cluster_id, None
+            analysis.person_id = None
         model = self.embedder.key if self.embedder else None
         cur = self.db.execute(
             "INSERT INTO phrases(horodatage, satellite, transcript, resultat, personne_id, score, "
@@ -356,6 +373,10 @@ class WhoSpeaks:
             ),
         )
         phrase_id = int(cur.lastrowid)
+        if detached_cluster is not None:
+            # _assign_cluster l'avait déjà compté dans ce groupe.
+            self._refresh_cluster(detached_cluster)
+            self.reload()
         clip = None
         if s["garder_audio"] and analysis.audio is not None and len(analysis.audio):
             clip = self._clip_path(phrase_id, analysis.horodatage)
@@ -636,7 +657,8 @@ class WhoSpeaks:
         where, params = "", []
         if filtre == "inconnu":
             where = "WHERE p.resultat='inconnu' AND p.etat='nouvelle'"
-        elif filtre in ("identifie", "trop_court", "enrolement", "reprise", "erreur"):
+        elif filtre in ("identifie", "trop_court", "enrolement", "reprise", "erreur",
+                        "ignoree_silence", "ignoree_hallucination"):
             where, params = "WHERE p.resultat=?", [filtre]
         elif filtre == "attribuee":
             where = "WHERE p.etat='attribuee'"
@@ -1110,8 +1132,10 @@ class WhoSpeaks:
             "SELECT (SELECT COUNT(*) FROM personnes) AS personnes, "
             "(SELECT COUNT(*) FROM echantillons) AS echantillons, "
             # Les reprises ne sont pas des identifications : comptées à part.
-            "(SELECT COUNT(*) FROM phrases WHERE resultat<>'reprise') AS phrases, "
+            "(SELECT COUNT(*) FROM phrases WHERE resultat<>'reprise' "
+            "AND resultat NOT LIKE 'ignoree_%') AS phrases, "
             "(SELECT COUNT(*) FROM phrases WHERE resultat='reprise') AS reprises, "
+            "(SELECT COUNT(*) FROM phrases WHERE resultat LIKE 'ignoree_%') AS ignorees, "
             "(SELECT COUNT(*) FROM clusters) AS groupes",
         )
         enrol = self._active_enrolement()

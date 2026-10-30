@@ -125,6 +125,8 @@ function personSelect(onPick, placeholder = "Attribuer à…") {
 
 function resultBadge(p) {
   const s = state.reglages;
+  if (p.resultat === "ignoree_silence") return h("span", { class: "badge none", title: "aucune parole détectée : texte vide renvoyé à HA" }, "ignorée (silence)");
+  if (p.resultat === "ignoree_hallucination") return h("span", { class: "badge none", title: "texte inventé par Whisper : texte vide renvoyé à HA" }, "ignorée (hallucination)");
   if (p.resultat === "reprise" && p.personne_id) {
     // Phrase trop courte : interlocuteur repris de la dernière identification.
     const corrigee = p.etat === "attribuee" ? ", corrigée" : "";
@@ -151,7 +153,8 @@ async function renderJournal() {
   const phrases = await api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...(state.filtre ? { filtre: state.filtre } : {}) }));
   const filtre = h("select", { onchange: (e) => { state.filtre = e.target.value; refresh(); } },
     [["", "Toutes les phrases"], ["identifie", "Reconnues"], ["inconnu", "Inconnues à traiter"],
-      ["attribuee", "Attribuées"], ["reprise", "Reprises"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"]]
+      ["attribuee", "Attribuées"], ["reprise", "Reprises"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"],
+      ["ignoree_silence", "Ignorées (silence)"], ["ignoree_hallucination", "Ignorées (hallucination)"]]
       .map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
   const list = phrases.length ? phrases.map((p) => h("div", { class: "card phrase" },
     h("div", {}, h("div", {}, fmtDate(p.horodatage)),
@@ -160,7 +163,7 @@ async function renderJournal() {
     h("div", { class: "grow" }, h("div", {}, resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—")),
     h("div", { class: "actions" },
       p.audio ? playButton(`/api/phrases/${p.id}/audio`) : null,
-      p.resultat === "reprise" || ((p.a_empreinte || p.audio) && p.resultat !== "trop_court")
+      p.resultat === "reprise" || ((p.a_empreinte || p.audio) && !["trop_court", "ignoree_silence"].includes(p.resultat))
         ? personSelect((b) => act(() => api("POST", `/api/phrases/${p.id}/attribuer`, b), "Phrase attribuée"),
           p.personne_id ? "Corriger…" : "Attribuer à…") : null,
       p.personne_id ? h("button", { title: "Ce n'était pas cette personne", onclick: () => act(() => api("POST", `/api/phrases/${p.id}/desattribuer`), "Remise en inconnue") }, "✗ pas lui/elle") : null,
@@ -339,6 +342,9 @@ const FIELDS = [
   ["duree_min_enrolement", "Parole minimale en enrôlement (s)", "number", 0.1],
   ["reprise_active", "Reprendre l'interlocuteur sur les phrases trop courtes", "checkbox"],
   ["reprise_duree_s", "Durée de reprise (s, 0 à 600)", "number", 1, [0, 600]],
+  ["filtre_silence_actif", "Ne rien transcrire quand personne ne parle", "checkbox"],
+  ["silence_max_s", "Parole en dessous de laquelle c'est du silence (s, 0 à 2)", "number", 0.05, [0, 2]],
+  ["hallucinations", "Textes inventés par Whisper à ignorer (un par ligne ; « ~ » en tête : expression régulière)", "lines"],
   ["seuil_cluster", "Seuil de regroupement", "number", 0.01],
   ["seuil_ignore", "Seuil de la liste à ignorer", "number", 0.01],
   ["enrichissement_auto", "Enrichissement automatique", "checkbox"],
@@ -357,6 +363,12 @@ async function renderReglages() {
   const inputs = {};
   const fields = FIELDS.map(([key, label, type, opt, bounds]) => {
     let input;
+    if (type === "lines") {
+      input = h("textarea", { rows: 5, spellcheck: "false" });
+      input.value = (v[key] || []).join("\n");
+      inputs[key] = () => input.value.split("\n").map((l) => l.trim()).filter(Boolean);
+      return h("label", { class: "wide" }, label, input);
+    }
     if (type === "checkbox") {
       input = h("input", { type: "checkbox", checked: !!v[key] });
       inputs[key] = () => input.checked;

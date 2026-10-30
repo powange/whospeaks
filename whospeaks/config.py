@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .filters import check_regexes
+
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
@@ -126,6 +128,16 @@ DEFAULT_SETTINGS: dict = {
     # Phrase trop courte : reprendre l'interlocuteur identifié il y a moins de N secondes.
     "reprise_active": True,
     "reprise_duree_s": 120,
+    # Pas de parole (VAD) ou texte inventé par Whisper : transcript vide, HA ne répond pas.
+    "filtre_silence_actif": True,
+    "silence_max_s": 0.3,
+    # Comparées au texte normalisé ; « ~ » en tête : expression régulière.
+    "hallucinations": [
+        "merci",
+        "sous-titrage st' 501",
+        "sous-titres réalisés par la communauté d'amara.org",
+        "...",
+    ],
     "modele": None,  # None : on utilise la variable MODEL
     "personnes_ha": {},  # nom -> person.xxx (complète le champ de chaque personne)
 }
@@ -133,6 +145,7 @@ DEFAULT_SETTINGS: dict = {
 # Bornes des réglages numériques (min, max) ; les autres réglages ne sont contrôlés qu'en type.
 _BOUNDS: dict[str, tuple[float, float]] = {
     "reprise_duree_s": (0, 600),
+    "silence_max_s": (0, 2),
 }
 
 
@@ -150,5 +163,11 @@ def validate_settings(values: dict) -> dict:
             low, high = _BOUNDS.get(key, (float("-inf"), float("inf")))
             if not low <= value <= high:
                 raise ValueError(f"{key} : doit être entre {low:g} et {high:g}")
+        elif isinstance(default, list):
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"{key} : liste de textes attendue")
+            value = [v.strip() for v in value if v.strip()]
+            if key == "hallucinations":
+                check_regexes(value)
         clean[key] = value
     return clean

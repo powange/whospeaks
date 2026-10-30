@@ -96,6 +96,7 @@ a:has(> button) { text-decoration: none; color: inherit; }
 .message.erreur { background: var(--bad); color: #fff; }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px 16px; }
 .form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
+.form-grid label.wide { grid-column: 1 / -1; }
 .form-grid label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 15px; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 td, th { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: left; }

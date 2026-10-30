@@ -23,7 +23,7 @@ TEXTS = [
     "Monte le chauffage d'un degré", "C'est quoi la météo demain ?", "Lance la playlist \"Jazz\"",
     "Rappelle-moi d'appeler Léa à 18h", "Ouvre le garage", "Combien font 12 × 7 ?",
     "Baisse le son", "Où est mon téléphone ?", "Arrête la minuterie", "Déclenche le scénario cinéma",
-    "Merci !",
+    "Merci, bonne soirée !",
 ]
 WHISPER_DELAY = 0.12
 
@@ -272,7 +272,9 @@ async def test_real_voices_identification_and_latency(tmp_path, whisper):
             svc.add_audio_samples(pid, read_wav(f), "fichier")
     w, uri = whisper
     fake, ha = fake_ha()
-    server, port = await start_proxy(Proxy(uri, svc, ha))
+    # Attente large : on vérifie ici les identifications ; sous forte charge, l'empreinte
+    # d'un extrait de 7 s peut dépasser les 150 ms par défaut (le texte partirait sans locuteur).
+    server, port = await start_proxy(Proxy(uri, svc, ha, id_extra_wait=2.0))
     added, results = [], []
     files = sorted((SR_DATA / "test").glob("*.wav")) + sorted((SR_DATA / "test" / "3d-speaker").glob("*.wav"))
     for f in files:

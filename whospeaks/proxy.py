@@ -16,6 +16,7 @@ from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler
 
 from . import __version__
+from .filters import is_hallucination
 from .ha import HomeAssistant
 from .service import Analysis, WhoSpeaks
 
@@ -115,6 +116,9 @@ class ProxyHandler(AsyncEventHandler):
         self.audio = bytearray()
         self.satellite: str | None = None
         self.analysis_future: asyncio.Future | None = None
+        self.silence_task: asyncio.Task | None = None
+        # Un transcript a déjà été renvoyé pour cette phrase : la suite de l'amont est ignorée.
+        self.replied = False
         self.t_stop = 0.0
 
     # -------------------------------------------------------------- client -> amont
@@ -131,6 +135,7 @@ class ProxyHandler(AsyncEventHandler):
         if AudioStart.is_type(event.type):
             self.audio.clear()
             self.analysis_future = None
+            self.replied = False
 
         if self.upstream is None and not await self._connect_upstream():
             await self.write_event(Error(text="Serveur STT amont injoignable", code="upstream").event())
@@ -169,6 +174,34 @@ class ProxyHandler(AsyncEventHandler):
         loop = asyncio.get_running_loop()
         self.analysis_future = loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
                                                     self.satellite)
+        if service.settings["filtre_silence_actif"]:
+            self.silence_task = asyncio.create_task(self._reply_if_silence(self.analysis_future),
+                                                    name="whospeaks silence")
+
+    async def _reply_if_silence(self, future: asyncio.Future) -> None:
+        """Pas de parole : texte vide tout de suite, sans attendre Whisper.
+
+        HA termine alors le run sur « stt-no-text-recognized », sans conversation
+        ni réponse vocale. Le texte de Whisper, s'il arrive, est ignoré.
+        """
+        try:
+            analysis: Analysis = await asyncio.shield(future)
+        except Exception:  # noqa: BLE001
+            return  # l'erreur est traitée à l'arrivée du transcript
+        if analysis.resultat != "ignoree_silence" or self.replied or future is not self.analysis_future:
+            return
+        self.analysis_future = None
+        # Enregistré avant la réponse : HA coupe la connexion dès qu'il la reçoit.
+        self._schedule_record(self.proxy.service, future, None, None, "silence")
+        await self._write_empty("silence")
+        _LOGGER.info("Phrase ignorée : pas de parole (%.2fs) | réponse vide envoyée %.0f ms après la fin",
+                     analysis.duree_parole, (time.perf_counter() - self.t_stop) * 1000)
+
+    async def _write_empty(self, reason: str) -> None:
+        self.replied = True
+        event = Transcript(text="").event()
+        event.data["ignored"] = reason
+        await self.write_event(event)
 
     # -------------------------------------------------------------- amont -> client
     async def _read_upstream(self, client: AsyncClient) -> None:
@@ -177,6 +210,8 @@ class ProxyHandler(AsyncEventHandler):
                 event = await client.read_event()
                 if event is None:
                     break
+                if self.replied:
+                    continue  # réponse déjà faite (silence) : rien de l'amont ne doit passer
                 if Transcript.is_type(event.type):
                     await self._send_transcript(event)
                 else:
@@ -210,7 +245,21 @@ class ProxyHandler(AsyncEventHandler):
             _LOGGER.exception("Identification en échec")
             future = None
 
+        if self.replied:
+            return  # le silence a répondu pendant l'attente
+
         service = self.proxy.service
+        filtered = self._filter_reason(analysis, text)
+        if filtered:
+            # Texte vide : HA s'arrête sur « stt-no-text-recognized ». Pas de capteur publié.
+            if service is not None and future is not None:
+                self._schedule_record(service, future, text, (time.perf_counter() - t_up) * 1000,
+                                      filtered)
+            await self._write_empty(filtered)
+            _LOGGER.info("Phrase ignorée (%s) : « %s » | ajouté %.1f ms", filtered, text,
+                         (time.perf_counter() - t_up) * 1000)
+            return
+
         if service is not None and self.proxy.ha is not None:
             try:
                 payload = service.ha_payload(analysis or Analysis("erreur"), text)
@@ -223,6 +272,7 @@ class ProxyHandler(AsyncEventHandler):
             # Le texte reste celui de Whisper ; on ajoute seulement des champs.
             out = Event(type=event.type, data={**event.data, "speaker": analysis.etat,
                                                 "speaker_score": analysis.score}, payload=event.payload)
+        self.replied = True
         await self.write_event(out)
         t_sent = time.perf_counter()
         added_ms = (t_sent - t_up) * 1000
@@ -240,8 +290,19 @@ class ProxyHandler(AsyncEventHandler):
         if service is not None and future is not None:
             self._schedule_record(service, future, text, added_ms)
 
+    def _filter_reason(self, analysis: Analysis | None, text: str | None) -> str | None:
+        """« silence », « hallucination » ou None si le texte doit passer."""
+        service = self.proxy.service
+        if service is None or not service.settings["filtre_silence_actif"]:
+            return None
+        if analysis is not None and analysis.resultat == "ignoree_silence":
+            return "silence"
+        if is_hallucination(text, service.settings["hallucinations"]):
+            return "hallucination"
+        return None
+
     def _schedule_record(self, service: WhoSpeaks, future: asyncio.Future, text: str | None,
-                         added_ms: float) -> None:
+                         added_ms: float | None, filtered: str | None = None) -> None:
         loop = asyncio.get_running_loop()
         satellite = self.satellite
 
@@ -249,15 +310,21 @@ class ProxyHandler(AsyncEventHandler):
             if fut.cancelled() or fut.exception() is not None:
                 return
             analysis = fut.result()
+            if filtered:
+                analysis.resultat = f"ignoree_{filtered}"
+            elif analysis.resultat == "ignoree_silence":
+                # Analyse arrivée trop tard : le texte est déjà parti vers HA.
+                analysis.resultat = "trop_court"
             loop.run_in_executor(self.proxy.record_pool, _safe_record, service, analysis, text,
                                  satellite, added_ms)
 
         future.add_done_callback(done)
 
     async def disconnect(self) -> None:
-        if self.upstream_task is not None and not self.upstream_task.done():
-            # Le client est parti : inutile d'attendre la suite de l'amont.
-            self.upstream_task.cancel()
+        for task in (self.upstream_task, self.silence_task):
+            if task is not None and not task.done():
+                # Le client est parti : inutile d'attendre la suite.
+                task.cancel()
         if self.upstream is not None:
             try:
                 await self.upstream.disconnect()
@@ -267,7 +334,7 @@ class ProxyHandler(AsyncEventHandler):
 
 
 def _safe_record(service: WhoSpeaks, analysis: Analysis, text: str | None, satellite: str | None,
-                 added_ms: float) -> None:
+                 added_ms: float | None) -> None:
     try:
         service.record(analysis, text, satellite, added_ms)
     except Exception:  # noqa: BLE001

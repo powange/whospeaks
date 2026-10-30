@@ -135,6 +135,12 @@ Si l'on change de modèle, toutes les empreintes sont recalculées à partir de 
 
 Le texte transmis à HA est strictement celui de Whisper. Seuls deux champs sont ajoutés à l'événement Wyoming `transcript` : `speaker` et `speaker_score`.
 
+Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un texte connu, WhoSpeaks renvoie un texte **vide** (voir « Comment une phrase est classée », étape 0).
+
+- HA termine alors le run sur l'erreur `stt-no-text-recognized` : pas de conversation, pas de réponse vocale.
+- Le capteur n'est pas mis à jour.
+- L'événement `transcript` porte le champ `ignored` (`silence` ou `hallucination`).
+
 ## Utilisation
 
 - **Enrôler** (onglet Personnes) : créer la personne, cliquer sur « Enrôler par les satellites », puis dire 12 phrases variées d'au moins 2 s (« Jarvis… » puis la phrase). Chaque phrase d'au moins 1,5 s est comptée, quel que soit le résultat d'identification. L'événement `whospeaks_enrolement` {personne, n, total} suit l'avancement. On peut aussi envoyer des fichiers WAV/MP3 ou enregistrer dans le navigateur (le micro du navigateur exige HTTPS ou localhost).
@@ -147,6 +153,14 @@ Le texte transmis à HA est strictement celui de Whisper. Seuls deux champs sont
 
 ### Comment une phrase est classée
 
+0. **Silence et hallucinations** (si `filtre_silence_actif`, activé par défaut). Whisper invente souvent du texte sur du silence ou du bruit : `...`, `Merci.`, `Sous-titrage ST' 501`… Après un faux réveil du mot-clé, ce texte partait vers Ollama, qui répondait à voix haute. Désormais :
+   - **pas de parole** : si le VAD mesure moins de `silence_max_s` (0,3 s) de parole, WhoSpeaks renvoie tout de suite un texte vide, sans attendre Whisper. Résultat `ignoree_silence`.
+   - **texte inventé** : même avec de la parole, si le texte de Whisper normalisé (minuscules, sans ponctuation, symboles ni espaces) est vide ou figure dans la liste `hallucinations`, le texte renvoyé est vide. Résultat `ignoree_hallucination`.
+     - Liste par défaut : `merci`, `sous-titrage st' 501`, `sous-titres réalisés par la communauté d'amara.org` et `...`.
+     - Une entrée commençant par `~` est une expression régulière, cherchée sans tenir compte de la casse dans le texte brut. Par exemple, `~^sous-titres? réalisés? par` couvre toutes les variantes.
+     - Seul le texte entier est comparé : « Merci, éteins la lumière » passe ; « Merci. » seul ne passe pas, même adressé à Jarvis.
+   - Ces phrases sont gardées dans le journal avec leur audio (filtres « Ignorées (silence) » et « Ignorées (hallucination) »). Elles ne nourrissent ni les groupes de voix inconnues ni les échantillons.
+   - Si le modèle n'est pas chargé, le silence ne peut pas être mesuré, mais les hallucinations restent filtrées.
 1. Le VAD retire le silence. Une phrase de moins de `duree_min_parole` (1,0 s) de parole est trop courte pour une empreinte fiable :
    - **reprise** : si une personne a été identifiée (ou enrôlée) il y a moins de `reprise_duree_s` (120 s), la phrase lui est attribuée avec le résultat `reprise`. Le capteur garde donc le prénom sur « stop » ou « allume la lumière » au milieu d'un échange.
      - Aucune empreinte n'est calculée, et la phrase ne devient jamais un échantillon : ni automatique, ni d'enrôlement, ni par « Corriger… », qui ne change que l'étiquette.

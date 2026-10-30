@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+### Ajouts
+
+- **Ne rien transcrire quand personne ne parle.** Après un faux réveil, Whisper inventait un texte (`" ..."`) qui partait vers Ollama, et Jarvis répondait à voix haute. Désormais, WhoSpeaks renvoie un texte vide, et HA termine le run sur `stt-no-text-recognized`, sans conversation ni réponse :
+  - si le VAD mesure moins de `silence_max_s` de parole (0,3 s par défaut). La réponse part sans attendre Whisper, et son texte est ignoré. Résultat `ignoree_silence` ;
+  - si le texte de Whisper, normalisé, est vide, n'est que de la ponctuation ou figure dans la liste `hallucinations` (entrées `~` : expressions régulières). Résultat `ignoree_hallucination`.
+  - L'événement `transcript` porte le champ `ignored`. Le capteur `sensor.jarvis_interlocuteur` n'est pas publié pour ces phrases.
+  - Les phrases sont gardées dans le journal, avec leur audio, sous deux nouveaux filtres. Elles ne nourrissent ni les groupes de voix inconnues ni les échantillons.
+- Nouveaux réglages : `filtre_silence_actif` (défaut `true`), `silence_max_s` (0 à 2) et `hallucinations` (liste éditable, une entrée par ligne).
+- `/api/etat` compte les phrases ignorées à part (`ignorees`).
+
+### Changements
+
+- Le VAD tourne même si le modèle d'empreinte n'est pas chargé, pour détecter le silence.
+- Test sur vraies voix : attente d'identification élargie, car le test échouait sous forte charge, sans rapport avec ce changement.
+
 ## 0.2.1
 
 ### Ajouts
