@@ -8,7 +8,7 @@ import ipaddress
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -18,7 +18,7 @@ from starlette.background import BackgroundTask
 
 from . import __version__
 from .audio import decode_file
-from .config import DEFAULT_SETTINGS, Config
+from .config import DEFAULT_SETTINGS, Config, IPNetwork
 from .models import SPEAKER_MODELS
 from .service import ServiceError, WhoSpeaks
 
@@ -65,11 +65,16 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        if config.ui_local_only and not _is_local(request.client.host if request.client else None):
+        peer = request.client.host if request.client else None
+        trusted = _in_networks(peer, config.trusted_proxies)
+        client = client_ip(peer, request.headers, config.trusted_proxies)
+        if config.ui_local_only and not _is_local(client):
             return JSONResponse({"detail": "Accès réservé au réseau local"}, status_code=403)
         response = await call_next(request)
         # Autorise l'affichage dans une carte iframe de Home Assistant.
         response.headers["Content-Security-Policy"] = f"frame-ancestors {frame_origins}"
+        if _scheme(request, trusted) == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
         token = request.query_params.get("token")
         if token and config.ui_token and hmac.compare_digest(token, config.ui_token):
             # Le cookie évite de répéter le jeton dans chaque URL (lecteurs audio…).
@@ -337,15 +342,63 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
     return app
 
 
-def _is_local(host: str | None) -> bool:
+def client_ip(peer: str | None, headers: Mapping[str, str], trusted: list[IPNetwork]) -> str | None:
+    """Adresse du client réel.
+
+    Les en-têtes ne sont lus que si la connexion vient d'un proxy de confiance.
+    X-Forwarded-For est parcouru de droite à gauche : chaque proxy ajoute à droite
+    l'adresse qu'il voit, donc la première adresse non fiable est celle du client ;
+    tout ce qui est plus à gauche a pu être inventé par lui.
+    """
+    if not _in_networks(peer, trusted):
+        return peer
+    forwarded = ",".join(headers.getlist("x-forwarded-for")) if hasattr(headers, "getlist") \
+        else headers.get("x-forwarded-for", "")
+    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+    if hops:
+        for hop in reversed(hops):
+            if not _in_networks(hop, trusted):
+                return hop
+        return hops[0]  # toute la chaîne est de confiance
+    real_ip = (headers.get("x-real-ip") or "").strip()
+    return real_ip or peer
+
+
+def _scheme(request: Request, trusted: bool) -> str:
+    if trusted:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if proto:
+            return proto
+    return request.url.scheme
+
+
+def _parse_ip(host: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     if not host:
-        return False
-    if host in ("testclient", "localhost"):
-        return True
+        return None
+    host = host.strip()
+    # Formes « [::1]:8080 » et « 1.2.3.4:8080 » parfois envoyées par les proxys.
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        return None
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-        addr = addr.ipv4_mapped
+        return addr.ipv4_mapped
+    return addr
+
+
+def _in_networks(host: str | None, networks: list[IPNetwork]) -> bool:
+    addr = _parse_ip(host)
+    return addr is not None and any(addr in net for net in networks)
+
+
+def _is_local(host: str | None) -> bool:
+    if host in ("testclient", "localhost"):
+        return True
+    addr = _parse_ip(host)
+    if addr is None:
+        return False
     return addr.is_private or addr.is_loopback or addr.is_link_local

@@ -16,6 +16,7 @@ services:
       HA_URL: http://192.168.0.201:8123
       HA_TOKEN: ${WHOSPEAKS_HA_TOKEN}     # jeton longue durée HA (fichier .env)
       UI_TOKEN: ${WHOSPEAKS_UI_TOKEN}     # jeton de la page web
+      # TRUSTED_PROXIES: 172.18.0.2   # seulement derrière un proxy inverse (voir README)
       MODEL: campplus-zh-en
       LANG: fr
       TZ: Europe/Paris

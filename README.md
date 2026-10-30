@@ -37,12 +37,32 @@ Au premier démarrage, les modèles (Silero VAD, puis le modèle d'empreinte) so
 | `MODEL` | `campplus-zh-en` | modèle d'empreinte (voir ci-dessous) ; la page Réglages peut le changer |
 | `LANG` | `fr` | langue annoncée si l'amont ne répond pas |
 | `UI_LOCAL_ONLY` | `true` | refuse les clients hors réseau privé |
+| `TRUSTED_PROXIES` | — (vide) | proxys inverses de confiance : IP ou réseaux, séparés par des virgules ou des espaces (voir ci-dessous) |
 | `FRAME_ANCESTORS` | — | origines en plus de `HA_URL` autorisées à afficher la page en iframe |
 | `HA_SENSOR` / `HA_EVENT` | `sensor.jarvis_interlocuteur` / `jarvis_interlocuteur` | noms côté HA |
 | `HA_TIMEOUT` | `0.3` | délai max (s) de la notification HA |
 | `ID_EXTRA_WAIT` | `0.15` | attente max (s) de l'identification après le texte de Whisper |
 | `NUM_THREADS` | `4` | threads ONNX pour l'empreinte |
 | `TZ` | — | fuseau horaire (horodatages) |
+
+### Derrière un proxy inverse
+
+Derrière un proxy inverse (Nginx Proxy Manager, Traefik, Caddy…), la page voit l'adresse du proxy et non celle du client. `UI_LOCAL_ONLY` laisserait alors passer tout le monde, puisque le proxy a une adresse privée. Il faut déclarer le proxy :
+
+```yaml
+TRUSTED_PROXIES: 172.18.0.0/16, 192.168.0.20
+```
+
+- Les en-têtes `X-Forwarded-For`, `X-Real-IP` et `X-Forwarded-Proto` ne sont lus que si la connexion vient d'une adresse de cette liste. Venant d'ailleurs, ils sont ignorés.
+- Dans `X-Forwarded-For`, l'adresse du client est **la première adresse non fiable en partant de la droite**. Chaque proxy ajoute à droite l'adresse qu'il voit ; ce qui est plus à gauche a pu être écrit par le client lui-même. Un `X-Forwarded-For: 192.168.0.50` envoyé depuis Internet ne fait donc pas passer pour local.
+- `X-Real-IP` ne sert qu'en l'absence de `X-Forwarded-For`. Le proxy doit le **remplacer**, pas le recopier depuis la requête (dans Nginx : `proxy_set_header X-Real-IP $remote_addr;`).
+- Le filtre `UI_LOCAL_ONLY` s'applique à l'adresse ainsi obtenue.
+- Quand la requête arrive en HTTPS (`X-Forwarded-Proto: https` venant d'un proxy de confiance), la réponse porte `Strict-Transport-Security: max-age=31536000`. L'en-tête est sans `includeSubDomains`, pour ne pas imposer HTTPS aux autres services du domaine.
+- uvicorn est lancé avec `proxy_headers=False` : seul WhoSpeaks interprète ces en-têtes, selon `TRUSTED_PROXIES`. La variable `FORWARDED_ALLOW_IPS` d'uvicorn est donc sans effet.
+
+Ne mettre dans la liste que les proxys eux-mêmes, au plus juste. Déclarer tout le réseau local permettrait à n'importe quelle machine du réseau d'annoncer une fausse adresse.
+
+Ce réglage ne concerne que la page web (8095), pas le port Wyoming (10302).
 
 ### Modèles disponibles
 

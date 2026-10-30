@@ -6,9 +6,23 @@ les valeurs ci-dessous ne servent que de valeurs initiales.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def parse_networks(value: str) -> list[IPNetwork]:
+    """« 10.0.0.1, 172.18.0.0/16 fd00::/8 » -> réseaux ; une IP seule devient un /32 (/128)."""
+    networks = []
+    for item in value.replace(",", " ").split():
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError as err:
+            raise ValueError(f"TRUSTED_PROXIES : entrée invalide « {item} »") from err
+    return networks
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -30,6 +44,8 @@ class Config:
     ui_local_only: bool = True
     # Origines autorisées à afficher la page dans une iframe (en plus de HA_URL).
     frame_ancestors: list[str] = field(default_factory=list)
+    # Proxys inverses dont on croit les en-têtes X-Forwarded-For / X-Real-IP / X-Forwarded-Proto.
+    trusted_proxies: list[IPNetwork] = field(default_factory=list)
     model: str = "campplus-zh-en"
     lang: str = "fr"
     data_dir: Path = Path("/data")
@@ -68,6 +84,7 @@ class Config:
             ui_token=env("UI_TOKEN", ""),
             ui_local_only=_env_bool("UI_LOCAL_ONLY", True),
             frame_ancestors=frame,
+            trusted_proxies=parse_networks(env("TRUSTED_PROXIES", "")),
             model=env("MODEL", cls.model),
             lang=env("LANG_STT", env("WHOSPEAKS_LANG", _lang_from_env())),
             data_dir=Path(env("DATA_DIR", "/data")),

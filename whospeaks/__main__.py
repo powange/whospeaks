@@ -37,6 +37,14 @@ async def _maintenance(service: WhoSpeaks) -> None:
         await asyncio.sleep(_MODEL_RETRY if not service.ready else 600)
 
 
+def web_server_config(app, config: Config) -> uvicorn.Config:
+    # proxy_headers=False : request.client reste l'adresse TCP réelle. Les en-têtes
+    # X-Forwarded-* sont lus par la page web seulement, et seulement depuis TRUSTED_PROXIES
+    # (sinon uvicorn ferait confiance à 127.0.0.1 ou à FORWARDED_ALLOW_IPS, à part).
+    return uvicorn.Config(app, host=config.web_host, port=config.web_port, log_level="warning",
+                          access_log=False, proxy_headers=False)
+
+
 async def _run(config: Config) -> None:
     ha = HomeAssistant(config.ha_url, config.ha_token, config.sensor_entity, config.ha_event,
                        config.ha_timeout)
@@ -62,8 +70,7 @@ async def _run(config: Config) -> None:
     if service is not None:
         tasks.append(asyncio.create_task(_maintenance(service), name="maintenance"))
         app = create_app(service, config)
-        web = uvicorn.Server(uvicorn.Config(app, host=config.web_host, port=config.web_port,
-                                            log_level="warning", access_log=False))
+        web = uvicorn.Server(web_server_config(app, config))
         tasks.append(asyncio.create_task(web.serve(), name="web"))
         _LOGGER.info("Page web sur http://%s:%d", config.web_host, config.web_port)
     try:
