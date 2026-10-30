@@ -1,0 +1,25 @@
+# Stack Portainer du Beelink (192.168.0.13), suivie sur la branche `deploy`.
+# Autonome : Whisper tourne sur le GEEKOM, joint par le réseau local.
+# L'image est construite par GitHub Actions (.github/workflows/image.yml).
+services:
+  whospeaks:
+    image: ghcr.io/powange/whospeaks:latest
+    pull_policy: always
+    container_name: whospeaks
+    restart: unless-stopped
+    ports:
+      - "10302:10302"   # proxy STT Wyoming (HA)
+      - "8095:8095"     # page web (optionnel si NPM passe par le réseau Docker)
+    environment:
+      UPSTREAM_URI: ${UPSTREAM_URI:-tcp://192.168.0.11:10301}
+      HA_URL: ${HA_URL:-http://192.168.0.201:8123}
+      HA_TOKEN: ${WHOSPEAKS_HA_TOKEN}
+      UI_TOKEN: ${WHOSPEAKS_UI_TOKEN}
+      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-https://ha.powange.com}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}   # vide : aucun proxy de confiance
+      MODEL: ${MODEL:-campplus-zh-en}
+      LANG: fr
+      TZ: Europe/Paris
+    volumes:
+      # Disque local uniquement : SQLite en WAL ne supporte pas le NFS.
+      - ${WHOSPEAKS_DATA:-/home/powange/docker_workspaces/whospeaks/data}:/data

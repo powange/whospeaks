@@ -452,7 +452,7 @@ function renderBandeau() {
     h("button", { onclick: () => act(() => api("DELETE", "/api/enrolement"), "Enrôlement arrêté") }, "Arrêter"));
   const s = state.etat;
   document.getElementById("statut").textContent = s.modele_charge
-    ? `${s.modele_charge} · ${s.personnes} pers. · ${s.phrases} phrases`
+    ? `v${s.version}${s.commit ? ` (${s.commit})` : ""} · ${s.modele_charge} · ${s.personnes} pers. · ${s.phrases} phrases`
     : `⚠ modèle non chargé${s.modele_erreur ? " : " + s.modele_erreur : ""}`;
 }
 

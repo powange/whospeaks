@@ -10,6 +10,10 @@ COPY pyproject.toml ./
 COPY whospeaks ./whospeaks
 RUN pip install .
 
+# Commit de l'image, affiché par la page (passé par GitHub Actions).
+ARG GIT_SHA=dev
+ENV WHOSPEAKS_COMMIT=$GIT_SHA
+
 VOLUME /data
 EXPOSE 10302 8095
 

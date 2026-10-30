@@ -26,6 +26,47 @@ Satellite → HA (pipeline Jarvis) ──Wyoming──▶ WhoSpeaks :10302 ─�
 
 Au premier démarrage, les modèles (Silero VAD, puis le modèle d'empreinte) sont téléchargés depuis les releases GitHub de sherpa-onnx et mis en cache dans `./data/models`. Pendant ce téléchargement, ou si le modèle est absent, le proxy reste transparent : le texte passe sans identification.
 
+Ce [docker-compose.yml](docker-compose.yml) sert à un déploiement **à côté de Whisper**, sur le GEEKOM. Pour le Beelink, voir la section suivante.
+
+## Déploiement Portainer (Beelink)
+
+Sur le Beelink (192.168.0.13), Portainer suit une stack Git et met WhoSpeaks à jour tout seul à chaque push sur `main` :
+
+1. Le workflow [image.yml](.github/workflows/image.yml) lance les tests. S'ils passent, il construit l'image `linux/amd64` et la publie sous `ghcr.io/powange/whospeaks:latest` et `:sha-<commit court>`.
+2. **Ensuite seulement**, il avance la branche `deploy` sur ce commit. Portainer ne voit donc jamais un commit dont l'image n'existe pas encore.
+3. Portainer voit que `deploy` a bougé, tire `latest` et recrée le conteneur.
+
+Portainer ne reconstruit pas toujours une image `build:` lors d'un redéploiement Git. C'est pour ça qu'il ne fait que tirer une image construite par GitHub Actions.
+
+### Mise en place (une fois)
+
+1. **Premier passage du workflow** : pousser sur `main`, ou le lancer à la main (Actions → Image → Run workflow). Il crée la branche `deploy` et le paquet GHCR.
+2. **Rendre le paquet public** : GitHub → profil → Packages → `whospeaks` → Package settings → Change visibility → Public. Sinon, Portainer a besoin d'identifiants de registre pour `ghcr.io`.
+3. **Créer la stack dans Portainer** : Stacks → Add stack → Repository.
+   - Repository URL : `https://github.com/powange/whospeaks`
+   - Repository reference : `refs/heads/deploy`
+   - Compose path : `deploy/docker-compose.beelink.yml`
+   - GitOps updates : activé, mécanisme **Polling**, intervalle `5m`
+   - **Re-pull image** : activé (indispensable : le tag `latest` ne change pas de nom)
+4. **Variables d'environnement de la stack** :
+
+   | Variable | Obligatoire | Défaut |
+   |---|---|---|
+   | `WHOSPEAKS_HA_TOKEN` | oui | — |
+   | `WHOSPEAKS_UI_TOKEN` | oui | — |
+   | `UPSTREAM_URI` | non | `tcp://192.168.0.11:10301` (Whisper du GEEKOM) |
+   | `HA_URL` | non | `http://192.168.0.201:8123` |
+   | `FRAME_ANCESTORS` | non | `https://ha.powange.com` |
+   | `TRUSTED_PROXIES` | non | vide : aucun proxy de confiance. Mettre l'IP de NPM si la page passe par lui |
+   | `MODEL` | non | `campplus-zh-en` |
+   | `WHOSPEAKS_DATA` | non | `/home/powange/docker_workspaces/whospeaks/data` |
+
+`WHOSPEAKS_DATA` doit être sur un **disque local**, jamais sur le NFS : SQLite (en mode WAL) n'y est pas fiable.
+
+Après un push, la page affiche la version et le commit de l'image dans l'en-tête, par exemple `v0.2.1 (abc1234)`. On vérifie ainsi que Portainer a redéployé. Compter jusqu'à 5 min après la fin du workflow.
+
+En cas de problème, le tag `:sha-<commit>` permet de revenir temporairement à une image précise, en le mettant à la place de `latest` dans la stack.
+
 ### Variables d'environnement
 
 | Variable | Défaut | Rôle |

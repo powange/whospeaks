@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1
+
+### Ajouts
+
+- **Déploiement automatique sur le Beelink (Portainer).**
+  - Le workflow GitHub Actions `image.yml` lance les tests, publie `ghcr.io/powange/whospeaks:latest` et `:sha-<court>` (`linux/amd64`, cache GHA), puis avance la branche `deploy` une fois l'image publiée.
+  - Une construction plus ancienne encore en cours est annulée, pour qu'elle ne republie pas une image plus vieille.
+- `deploy/docker-compose.beelink.yml` : stack autonome pour Portainer (image GHCR, `pull_policy: always`, données sur disque local).
+- Le commit de l'image (`WHOSPEAKS_COMMIT`, passé au build) est exposé dans `/api/etat` (`commit`). L'en-tête de la page affiche la version et ce commit.
+
+### Documentation
+
+- README : section « Déploiement Portainer (Beelink) ». Le `docker-compose.yml` d'origine reste pour un déploiement à côté de Whisper.
+
 ## 0.2.0
 
 ### Ajouts

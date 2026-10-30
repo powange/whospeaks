@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import ipaddress
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -114,7 +115,8 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
     # ---------------------------------------------------------------- état
     @app.get("/api/etat", dependencies=[api])
     async def etat():
-        return service.status() | {"version": __version__, "ha_url": config.ha_url}
+        commit = os.environ.get("WHOSPEAKS_COMMIT", "")[:7]
+        return service.status() | {"version": __version__, "commit": commit, "ha_url": config.ha_url}
 
     @app.get("/api/modeles", dependencies=[api])
     async def modeles():
