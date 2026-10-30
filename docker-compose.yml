@@ -1,0 +1,23 @@
+# Service à ajouter au docker-compose.yml existant, à côté de wyoming-whisper-gpu
+# (même fichier, donc même réseau Docker).
+services:
+  whospeaks:
+    build: https://github.com/powange/whospeaks.git   # ou « build: ./whospeaks » en local
+    image: whospeaks
+    container_name: whospeaks
+    restart: unless-stopped
+    depends_on:
+      - wyoming-whisper-gpu
+    ports:
+      - "10302:10302"   # proxy STT Wyoming
+      - "8095:8095"     # page web
+    environment:
+      UPSTREAM_URI: tcp://wyoming-whisper-gpu:10300
+      HA_URL: http://192.168.0.201:8123
+      HA_TOKEN: ${WHOSPEAKS_HA_TOKEN}     # jeton longue durée HA (fichier .env)
+      UI_TOKEN: ${WHOSPEAKS_UI_TOKEN}     # jeton de la page web
+      MODEL: campplus-zh-en
+      LANG: fr
+      TZ: Europe/Paris
+    volumes:
+      - ./data:/data

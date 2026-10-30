@@ -1,0 +1,61 @@
+# Exemples de configuration Home Assistant pour WhoSpeaks (phase 1, sans composant).
+# À placer dans configuration.yaml (ou un paquet). Le jeton UI est dans secrets.yaml :
+#   whospeaks_auth: "Bearer <UI_TOKEN>"
+
+rest_command:
+  whospeaks_enroler:
+    url: "http://192.168.0.11:8095/api/enrolement"
+    method: POST
+    headers:
+      Authorization: !secret whospeaks_auth
+    content_type: "application/json"
+    payload: '{"personne": "{{ personne }}", "n": {{ n | default(12) }}}'
+  whospeaks_arreter_enrolement:
+    url: "http://192.168.0.11:8095/api/enrolement"
+    method: DELETE
+    headers:
+      Authorization: !secret whospeaks_auth
+  whospeaks_attribuer_derniere:
+    url: "http://192.168.0.11:8095/api/derniere/attribuer"
+    method: POST
+    headers:
+      Authorization: !secret whospeaks_auth
+    content_type: "application/json"
+    payload: '{"nouveau_nom": "{{ personne }}"}'
+
+script:
+  whospeaks_enroler:
+    alias: "WhoSpeaks : enrôler une personne"
+    fields:
+      personne:
+        description: "Nom de la personne (créée si besoin)"
+        example: "Pierre"
+      n:
+        description: "Nombre de phrases"
+        example: 12
+    sequence:
+      - action: rest_command.whospeaks_enroler
+        data:
+          personne: "{{ personne }}"
+          n: "{{ n | default(12) }}"
+
+automation:
+  - alias: "WhoSpeaks : annoncer l'avancement de l'enrôlement"
+    triggers:
+      - trigger: event
+        event_type: whospeaks_enrolement
+    actions:
+      - action: persistent_notification.create
+        data:
+          notification_id: whospeaks_enrolement
+          title: "Enrôlement de {{ trigger.event.data.personne }}"
+          message: >-
+            {% set d = trigger.event.data %}
+            {% if d.fin is defined and d.fin == 'termine' %}Terminé : {{ d.n }} phrases enregistrées.
+            {% elif d.fin is defined %}Arrêté ({{ d.fin }}) à {{ d.n }}/{{ d.total }}.
+            {% else %}{{ d.n }}/{{ d.total }} phrases.{% endif %}
+
+# Carte iframe pour un tableau de bord :
+#   type: iframe
+#   url: http://192.168.0.11:8095/?token=<UI_TOKEN>
+#   aspect_ratio: 120%

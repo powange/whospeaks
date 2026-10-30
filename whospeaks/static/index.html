@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhoSpeaks</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>WhoSpeaks</h1>
+    <nav id="tabs">
+      <button data-tab="journal" class="active">Journal</button>
+      <button data-tab="personnes">Personnes</button>
+      <button data-tab="inconnus">Voix inconnues</button>
+      <button data-tab="reglages">Réglages</button>
+    </nav>
+    <span id="statut" class="statut"></span>
+  </header>
+  <div id="enrolement" class="bandeau" hidden></div>
+  <div id="message" class="message" hidden></div>
+  <main>
+    <section id="journal" class="tab active"></section>
+    <section id="personnes" class="tab"></section>
+    <section id="inconnus" class="tab"></section>
+    <section id="reglages" class="tab"></section>
+  </main>
+  <dialog id="token-dialog">
+    <form method="dialog">
+      <p>Jeton d'accès (UI_TOKEN) :</p>
+      <input id="token-input" type="password" autocomplete="current-password">
+      <menu><button value="ok">Valider</button></menu>
+    </form>
+  </dialog>
+  <script src="app.js"></script>
+</body>
+</html>
