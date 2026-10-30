@@ -123,6 +123,32 @@ DEFAULT_SETTINGS: dict = {
     # Garde l'audio des échantillons au-delà de la rétention : permet de recalculer
     # les empreintes si l'on change de modèle.
     "garder_audio_echantillons": True,
+    # Phrase trop courte : reprendre l'interlocuteur identifié il y a moins de N secondes.
+    "reprise_active": True,
+    "reprise_duree_s": 120,
     "modele": None,  # None : on utilise la variable MODEL
     "personnes_ha": {},  # nom -> person.xxx (complète le champ de chaque personne)
 }
+
+# Bornes des réglages numériques (min, max) ; les autres réglages ne sont contrôlés qu'en type.
+_BOUNDS: dict[str, tuple[float, float]] = {
+    "reprise_duree_s": (0, 600),
+}
+
+
+def validate_settings(values: dict) -> dict:
+    """Vérifie type et bornes des réglages envoyés par la page ; lève ValueError."""
+    clean = {}
+    for key, value in values.items():
+        default = DEFAULT_SETTINGS[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} : vrai ou faux attendu")
+        elif isinstance(default, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{key} : nombre attendu")
+            low, high = _BOUNDS.get(key, (float("-inf"), float("inf")))
+            if not low <= value <= high:
+                raise ValueError(f"{key} : doit être entre {low:g} et {high:g}")
+        clean[key] = value
+    return clean

@@ -20,7 +20,7 @@ import numpy as np
 
 from . import calibration, clustering, rotation
 from .audio import SAMPLE_RATE, pcm16_to_float, read_wav, write_wav
-from .config import DEFAULT_SETTINGS, Config
+from .config import DEFAULT_SETTINGS, Config, validate_settings
 from .db import Database, from_blob, to_blob
 from .engine import Embedder, Vad
 from .matching import identify
@@ -42,7 +42,7 @@ class ServiceError(Exception):
 
 @dataclass
 class Analysis:
-    resultat: str  # identifie | inconnu | trop_court | enrolement | erreur
+    resultat: str  # identifie | inconnu | trop_court | enrolement | reprise | erreur
     duree_parole: float = 0.0
     person_id: int | None = None
     nom: str | None = None
@@ -53,15 +53,15 @@ class Analysis:
     ignoree: bool = False
     temps_empreinte_ms: float = 0.0
     erreur: str | None = None
+    # Âge (s) de l'identification reprise, pour le résultat « reprise ».
+    reprise_age: float | None = None
     horodatage: float = field(default_factory=time.time)
     audio: np.ndarray | None = field(default=None, repr=False)
     emb: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def etat(self) -> str:
-        if self.resultat == "identifie" and self.nom:
-            return self.nom
-        if self.resultat == "enrolement" and self.nom:
+        if self.resultat in ("identifie", "enrolement", "reprise") and self.nom:
             return self.nom
         if self.resultat == "trop_court":
             return "trop court"
@@ -79,6 +79,18 @@ class Analysis:
             "duree_parole": round(self.duree_parole, 2),
             "resultat": self.resultat,
         }
+
+
+@dataclass
+class Memo:
+    """Dernière identification sûre (identifie ou enrolement), pour la reprise."""
+
+    person_id: int
+    nom: str | None
+    person_entity: str | None
+    score: float | None
+    horodatage: float
+    satellite: str | None
 
 
 @dataclass
@@ -111,6 +123,8 @@ class WhoSpeaks:
         self._cluster_sizes: list[int] = []
         self._ignores = np.zeros((0, 0), dtype=np.float32)
         self.enrolement: Enrolement | None = None
+        # Dernière identification par satellite ; la clé None est l'entrée globale.
+        self._memory: dict[str | None, Memo] = {}
         self.task: dict[str, Any] = {"nom": None, "etat": "inactif", "progression": 0.0, "message": ""}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.event_callback: EventCallback | None = None
@@ -187,7 +201,10 @@ class WhoSpeaks:
             )
 
     def update_settings(self, values: dict) -> dict:
-        clean = {k: v for k, v in values.items() if k in DEFAULT_SETTINGS}
+        try:
+            clean = validate_settings({k: v for k, v in values.items() if k in DEFAULT_SETTINGS})
+        except ValueError as err:
+            raise ServiceError(str(err)) from err
         old_model = self.model_key
         self.db.save_settings(clean)
         self.settings.update(clean)
@@ -198,7 +215,7 @@ class WhoSpeaks:
         return self.settings
 
     # ------------------------------------------------------------ identification
-    def analyze(self, pcm: bytes) -> Analysis:
+    def analyze(self, pcm: bytes, satellite: str | None = None) -> Analysis:
         """Appelé dans un thread à la fin de chaque phrase (audio 16 kHz mono 16 bits)."""
         audio = pcm16_to_float(pcm)
         if self.embedder is None or self.vad is None:
@@ -208,15 +225,14 @@ class WhoSpeaks:
         speech = self.vad.speech(audio)
         duree = len(speech) / SAMPLE_RATE
         enrol = self._active_enrolement()
-        if enrol is None and duree < s["duree_min_parole"]:
-            return Analysis(
-                "trop_court", duree_parole=duree, audio=audio,
-                temps_empreinte_ms=(time.perf_counter() - t0) * 1000,
-            )
+        if duree < s["duree_min_parole"]:
+            # Pendant l'enrôlement aussi : une phrase trop courte n'est pas comptée.
+            result = self._reprise(satellite) or Analysis("trop_court")
+            result.duree_parole = duree
+            result.audio = audio
+            result.temps_empreinte_ms = (time.perf_counter() - t0) * 1000
+            return result
         if enrol is not None and duree < s["duree_min_enrolement"]:
-            # Pendant l'enrôlement, une phrase trop courte n'est pas comptée.
-            if duree < s["duree_min_parole"]:
-                return Analysis("trop_court", duree_parole=duree, audio=audio)
             enrol = None
         emb = self.embedder.embed(speech[: int(_MAX_EMBED_SECONDS * SAMPLE_RATE)])
         t_emb = (time.perf_counter() - t0) * 1000
@@ -239,7 +255,39 @@ class WhoSpeaks:
                 result.ignoree = True
             else:
                 result.cluster_id = self._assign_cluster(emb)
+            if result.person_id is not None:
+                self._remember(result, satellite)
         return result
+
+    def _remember(self, result: Analysis, satellite: str | None) -> None:
+        """Mémorise une identification sûre ; appelé sous self._lock."""
+        memo = Memo(result.person_id, result.nom, result.person_entity, result.score,
+                    result.horodatage, satellite)
+        self._memory[None] = memo
+        if satellite:
+            self._memory[satellite] = memo
+
+    def _reprise(self, satellite: str | None) -> Analysis | None:
+        """Phrase trop courte : reprend l'interlocuteur identifié récemment.
+
+        Clé : le satellite s'il est connu (pas de reprise croisée entre satellites),
+        sinon l'entrée globale. La mémoire n'est pas rafraîchie, pour qu'une suite
+        de phrases courtes ne prolonge pas la reprise indéfiniment.
+        """
+        s = self.settings
+        if not s["reprise_active"]:
+            return None
+        with self._lock:
+            memo = self._memory.get(satellite or None)
+            # Nom et entité à jour ; personne supprimée entre-temps : pas de reprise.
+            meta = self._person_meta.get(memo.person_id) if memo else None
+        if memo is None or meta is None:
+            return None
+        age = time.time() - memo.horodatage
+        if age > float(s["reprise_duree_s"]):
+            return None
+        return Analysis("reprise", person_id=memo.person_id, nom=meta.get("nom"),
+                        person_entity=meta.get("person_entity"), score=memo.score, reprise_age=age)
 
     def _fill_person(self, result: Analysis, person_id: int) -> None:
         meta = self._person_meta.get(person_id, {})
@@ -314,13 +362,15 @@ class WhoSpeaks:
             write_wav(self.config.data_dir / clip, analysis.audio)
             self.db.execute("UPDATE phrases SET clip=? WHERE id=?", (clip, phrase_id))
 
+        # Seules ces deux issues ont une empreinte fiable ; une « reprise » n'en a pas.
         if analysis.emb is not None and analysis.person_id is not None:
             if analysis.resultat == "enrolement":
                 self._add_sample(analysis.person_id, analysis.emb, clip, transcript,
                                  "enrolement", phrase_id, analysis.duree_parole)
                 self._enrolement_progress()
             elif (
-                s["enrichissement_auto"]
+                analysis.resultat == "identifie"
+                and s["enrichissement_auto"]
                 and (analysis.score or 0) >= s["seuil_auto"]
                 and (analysis.marge or 0) >= s["marge_auto"]
             ):
@@ -393,6 +443,8 @@ class WhoSpeaks:
                 "cluster_id": analysis.cluster_id,
                 "duree_parole": round(analysis.duree_parole, 2),
                 "resultat": analysis.resultat,
+                "reprise": analysis.resultat == "reprise",
+                "age_s": None if analysis.reprise_age is None else round(analysis.reprise_age, 1),
                 "transcript": transcript,
                 "horodatage": _now_iso(analysis.horodatage),
             },
@@ -584,7 +636,7 @@ class WhoSpeaks:
         where, params = "", []
         if filtre == "inconnu":
             where = "WHERE p.resultat='inconnu' AND p.etat='nouvelle'"
-        elif filtre in ("identifie", "trop_court", "enrolement", "erreur"):
+        elif filtre in ("identifie", "trop_court", "enrolement", "reprise", "erreur"):
             where, params = "WHERE p.resultat=?", [filtre]
         elif filtre == "attribuee":
             where = "WHERE p.etat='attribuee'"
@@ -658,6 +710,11 @@ class WhoSpeaks:
         """Attribue (ou corrige) une phrase : elle devient un échantillon de la personne."""
         self._person(person_id)
         row = self._phrase(phrase_id)
+        if row["resultat"] == "reprise":
+            # Trop courte pour une empreinte fiable : on corrige l'étiquette, sans échantillon.
+            self.db.execute("UPDATE phrases SET personne_id=?, etat='attribuee' WHERE id=?",
+                            (person_id, phrase_id))
+            return
         emb = self._phrase_embedding(row)
         # Retire l'échantillon éventuel (auto ou attribution) d'une autre personne.
         for s in self.db.all("SELECT id FROM echantillons WHERE phrase_id=?", (phrase_id,)):
@@ -675,9 +732,11 @@ class WhoSpeaks:
         row = self._phrase(phrase_id)
         for s in self.db.all("SELECT id FROM echantillons WHERE phrase_id=?", (phrase_id,)):
             self.db.execute("DELETE FROM echantillons WHERE id=?", (s["id"],))
+        # Une reprise retirée redevient ce qu'elle était : une phrase trop courte.
+        resultat = "trop_court" if row["resultat"] == "reprise" else "inconnu"
         self.db.execute(
-            "UPDATE phrases SET personne_id=NULL, etat='nouvelle', resultat='inconnu' WHERE id=?",
-            (phrase_id,),
+            "UPDATE phrases SET personne_id=NULL, etat='nouvelle', resultat=? WHERE id=?",
+            (resultat, phrase_id),
         )
         self.reload()
         if row["empreinte"] is not None and self.embedder and row["modele"] == self.embedder.key:
@@ -1050,7 +1109,9 @@ class WhoSpeaks:
         counts = self.db.one(
             "SELECT (SELECT COUNT(*) FROM personnes) AS personnes, "
             "(SELECT COUNT(*) FROM echantillons) AS echantillons, "
-            "(SELECT COUNT(*) FROM phrases) AS phrases, "
+            # Les reprises ne sont pas des identifications : comptées à part.
+            "(SELECT COUNT(*) FROM phrases WHERE resultat<>'reprise') AS phrases, "
+            "(SELECT COUNT(*) FROM phrases WHERE resultat='reprise') AS reprises, "
             "(SELECT COUNT(*) FROM clusters) AS groupes",
         )
         enrol = self._active_enrolement()

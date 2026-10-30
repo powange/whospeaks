@@ -64,6 +64,8 @@ def test_journal_groups_and_settings(client, service):
     assert client.get("/api/groupes", headers=H).json() == []
 
     assert client.put("/api/reglages", json={"inconnu": 1}, headers=H).status_code == 400
+    r = client.put("/api/reglages", json={"reprise_duree_s": 900}, headers=H)
+    assert r.status_code == 400 and "entre 0 et 600" in r.json()["detail"]
     r = client.put("/api/reglages", json={"seuil_identification": 0.6}, headers=H).json()
     assert r["seuil_identification"] == 0.6
     assert client.post("/api/calibrage", headers=H).status_code == 400  # une seule personne

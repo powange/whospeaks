@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS phrases (
     horodatage REAL NOT NULL,
     satellite TEXT,
     transcript TEXT,
-    -- identifie | inconnu | trop_court | enrolement | erreur
+    -- identifie | inconnu | trop_court | enrolement | reprise | erreur
     resultat TEXT NOT NULL,
     personne_id INTEGER REFERENCES personnes(id) ON DELETE SET NULL,
     score REAL,

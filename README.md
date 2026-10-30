@@ -84,7 +84,7 @@ Si l'on change de modèle, toutes les empreintes sont recalculées à partir de 
 1. **Intégration** : ajouter une intégration Wyoming vers `192.168.0.11:10302`, puis choisir ce moteur STT dans le pipeline Jarvis. L'ancien `10301` reste disponible en secours.
 2. **Capteur** : `sensor.jarvis_interlocuteur` est créé au premier message.
    - État : nom de la personne, `inconnu` ou `trop court`.
-   - Attributs : `person_entity`, `score`, `marge`, `cluster`, `transcript`, `horodatage`, `duree_parole`, `resultat`.
+   - Attributs : `person_entity`, `score`, `marge`, `cluster`, `transcript`, `horodatage`, `duree_parole`, `resultat`, `reprise`, `age_s` (voir « Comment une phrase est classée »).
 3. **Événement** : `jarvis_interlocuteur` porte les mêmes données, avec `interlocuteur` pour le nom. Les deux messages partent **avant** le renvoi du texte.
 4. **Prompt Ollama** : utiliser `last_updated` plutôt que `last_changed`. Si la même personne parle deux fois de suite, l'état ne change pas, donc `last_changed` non plus, alors que `last_updated` suit l'attribut `horodatage`.
    ```jinja
@@ -106,7 +106,14 @@ Le texte transmis à HA est strictement celui de Whisper. Seuls deux champs sont
 
 ### Comment une phrase est classée
 
-1. Le VAD retire le silence. Moins de 1,0 s de parole donne `trop court`.
+1. Le VAD retire le silence. Une phrase de moins de `duree_min_parole` (1,0 s) de parole est trop courte pour une empreinte fiable :
+   - **reprise** : si une personne a été identifiée (ou enrôlée) il y a moins de `reprise_duree_s` (120 s), la phrase lui est attribuée avec le résultat `reprise`. Le capteur garde donc le prénom sur « stop » ou « allume la lumière » au milieu d'un échange.
+     - Aucune empreinte n'est calculée, et la phrase ne devient jamais un échantillon : ni automatique, ni d'enrôlement, ni par « Corriger… », qui ne change que l'étiquette.
+     - La mémoire n'est pas rafraîchie par une reprise : une suite de phrases courtes ne prolonge pas le délai.
+     - Elle est gardée par satellite quand HA indique le satellite dans l'événement `transcribe` (pas de reprise d'un satellite à l'autre), et sinon globalement. Le journal affiche une fois `satellite context: present/absent` à la première phrase reçue. Les versions actuelles de HA n'envoient pas ce contexte : c'est alors l'entrée globale qui sert.
+     - Le capteur porte `reprise: true` et `age_s`, l'âge en secondes de l'identification reprise. Les autres résultats portent `reprise: false`.
+     - Se désactive avec `reprise_active` dans les Réglages.
+   - sinon : `trop court`, sans regroupement.
 2. On calcule la similarité cosinus avec les échantillons de chaque personne : le maximum, ou la moyenne des 3 meilleurs.
 3. La personne est retenue si son score atteint `seuil_identification` (0,55) **et** dépasse la deuxième personne d'au moins `marge_min` (0,08). Sinon, la phrase est `inconnu` :
    - elle est comparée à la liste à ignorer (`seuil_ignore`) ;

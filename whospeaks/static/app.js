@@ -125,6 +125,12 @@ function personSelect(onPick, placeholder = "Attribuer à…") {
 
 function resultBadge(p) {
   const s = state.reglages;
+  if (p.resultat === "reprise" && p.personne_id) {
+    // Phrase trop courte : interlocuteur repris de la dernière identification.
+    const corrigee = p.etat === "attribuee" ? ", corrigée" : "";
+    return h("span", { class: "badge warn", title: `reprise de l'identification précédente (score ${fmtScore(p.score)})` },
+      `${p.nom || "?"} (reprise${corrigee})`);
+  }
   if (p.resultat === "identifie" || p.etat === "attribuee") {
     const sure = p.score !== null && p.score >= (s.seuil_auto ?? 0.75);
     const label = p.nom || "?";
@@ -145,7 +151,7 @@ async function renderJournal() {
   const phrases = await api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...(state.filtre ? { filtre: state.filtre } : {}) }));
   const filtre = h("select", { onchange: (e) => { state.filtre = e.target.value; refresh(); } },
     [["", "Toutes les phrases"], ["identifie", "Reconnues"], ["inconnu", "Inconnues à traiter"],
-      ["attribuee", "Attribuées"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"]]
+      ["attribuee", "Attribuées"], ["reprise", "Reprises"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"]]
       .map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
   const list = phrases.length ? phrases.map((p) => h("div", { class: "card phrase" },
     h("div", {}, h("div", {}, fmtDate(p.horodatage)),
@@ -154,7 +160,7 @@ async function renderJournal() {
     h("div", { class: "grow" }, h("div", {}, resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—")),
     h("div", { class: "actions" },
       p.audio ? playButton(`/api/phrases/${p.id}/audio`) : null,
-      (p.a_empreinte || p.audio) && p.resultat !== "trop_court"
+      p.resultat === "reprise" || ((p.a_empreinte || p.audio) && p.resultat !== "trop_court")
         ? personSelect((b) => act(() => api("POST", `/api/phrases/${p.id}/attribuer`, b), "Phrase attribuée"),
           p.personne_id ? "Corriger…" : "Attribuer à…") : null,
       p.personne_id ? h("button", { title: "Ce n'était pas cette personne", onclick: () => act(() => api("POST", `/api/phrases/${p.id}/desattribuer`), "Remise en inconnue") }, "✗ pas lui/elle") : null,
@@ -331,6 +337,8 @@ const FIELDS = [
   ["agregation", "Agrégation des échantillons", "select", [["max", "Maximum"], ["top3", "Moyenne des 3 meilleurs"]]],
   ["duree_min_parole", "Parole minimale (s)", "number", 0.1],
   ["duree_min_enrolement", "Parole minimale en enrôlement (s)", "number", 0.1],
+  ["reprise_active", "Reprendre l'interlocuteur sur les phrases trop courtes", "checkbox"],
+  ["reprise_duree_s", "Durée de reprise (s, 0 à 600)", "number", 1, [0, 600]],
   ["seuil_cluster", "Seuil de regroupement", "number", 0.01],
   ["seuil_ignore", "Seuil de la liste à ignorer", "number", 0.01],
   ["enrichissement_auto", "Enrichissement automatique", "checkbox"],
@@ -347,7 +355,7 @@ async function renderReglages() {
   const [cfg, modeles] = await Promise.all([api("GET", "/api/reglages"), api("GET", "/api/modeles")]);
   const v = cfg.valeurs;
   const inputs = {};
-  const fields = FIELDS.map(([key, label, type, opt]) => {
+  const fields = FIELDS.map(([key, label, type, opt, bounds]) => {
     let input;
     if (type === "checkbox") {
       input = h("input", { type: "checkbox", checked: !!v[key] });
@@ -358,7 +366,7 @@ async function renderReglages() {
       input = h("select", {}, opt.map(([val, l]) => h("option", { value: val, selected: v[key] === val }, l)));
       inputs[key] = () => input.value;
     } else {
-      input = h("input", { type: "number", step: opt, value: v[key] });
+      input = h("input", { type: "number", step: opt, value: v[key], min: bounds?.[0], max: bounds?.[1] });
       inputs[key] = () => Number(input.value);
     }
     return h("label", {}, label, input);

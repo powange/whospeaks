@@ -164,7 +164,7 @@ async def test_transcript_without_service(whisper):
 async def test_transcript_when_identification_crashes(service, whisper):
     _, uri = whisper
 
-    def boom(_):
+    def boom(*_):
         raise RuntimeError("modèle cassé")
 
     service.analyze = boom
@@ -178,9 +178,9 @@ async def test_transcript_when_identification_is_slow(service, whisper):
     _, uri = whisper
     real = service.analyze
 
-    def slow(data):
+    def slow(*args):
         time.sleep(1.0)
-        return real(data)
+        return real(*args)
 
     service.analyze = slow
     server, port = await start_proxy(Proxy(uri, service, None, id_extra_wait=0.15))

@@ -46,6 +46,18 @@ class Proxy:
         self.record_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whospeaks-db")
         self._info: Info | None = None
         self._info_time = 0.0
+        self._context_logged = False
+
+    def log_context(self, context: dict) -> None:
+        """Indique une seule fois si HA envoie un contexte (satellite) dans `transcribe`.
+
+        On ne peut le savoir qu'à la première phrase reçue, pas au démarrage.
+        """
+        if self._context_logged:
+            return
+        self._context_logged = True
+        _LOGGER.info("satellite context: %s%s", "present" if context else "absent",
+                     f" ({sorted(context)})" if context else " (reprise sur l'entrée globale)")
 
     async def get_info(self) -> Info:
         if self._info is not None and time.monotonic() - self._info_time < 60:
@@ -113,6 +125,7 @@ class ProxyHandler(AsyncEventHandler):
 
         if Transcribe.is_type(event.type):
             context = event.data.get("context") or {}
+            self.proxy.log_context(context)
             self.satellite = context.get("satellite_id") or context.get("device_id") or self.satellite
 
         if AudioStart.is_type(event.type):
@@ -154,7 +167,8 @@ class ProxyHandler(AsyncEventHandler):
             return
         pcm = bytes(self.audio)
         loop = asyncio.get_running_loop()
-        self.analysis_future = loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm)
+        self.analysis_future = loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
+                                                    self.satellite)
 
     # -------------------------------------------------------------- amont -> client
     async def _read_upstream(self, client: AsyncClient) -> None:
@@ -215,7 +229,7 @@ class ProxyHandler(AsyncEventHandler):
         _LOGGER.info(
             "Phrase : %s (score=%s, marge=%s, parole=%.2fs) | empreinte %.0f ms | whisper %.0f ms | "
             "ajouté %.1f ms | « %s »",
-            analysis.etat if analysis else "—",
+            (analysis.etat + (" [reprise]" if analysis.resultat == "reprise" else "")) if analysis else "—",
             f"{analysis.score:.3f}" if analysis and analysis.score is not None else "—",
             f"{analysis.marge:.3f}" if analysis and analysis.marge is not None else "—",
             analysis.duree_parole if analysis else 0.0,
