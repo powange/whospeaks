@@ -34,7 +34,7 @@ Sur le Beelink (192.168.0.13), Portainer suit une stack Git et met WhoSpeaks à 
 
 1. Le workflow [image.yml](.github/workflows/image.yml) lance les tests. S'ils passent, il construit l'image `linux/amd64` et la publie sous `ghcr.io/powange/whospeaks:latest` et `:sha-<commit court>`.
 2. **Ensuite seulement**, il avance la branche `deploy` sur ce commit. Portainer ne voit donc jamais un commit dont l'image n'existe pas encore.
-3. Portainer voit que `deploy` a bougé, tire `latest` et recrée le conteneur.
+3. Il appelle le webhook Portainer (secret `PORTAINER_WEBHOOK_URL`). Portainer relit `deploy`, tire `latest` et recrée le conteneur. Sans secret, cette étape ne fait rien, et Portainer peut se contenter d'interroger Git.
 
 Portainer ne reconstruit pas toujours une image `build:` lors d'un redéploiement Git. C'est pour ça qu'il ne fait que tirer une image construite par GitHub Actions.
 
@@ -46,7 +46,9 @@ Portainer ne reconstruit pas toujours une image `build:` lors d'un redéploiemen
    - Repository URL : `https://github.com/powange/whospeaks`
    - Repository reference : `refs/heads/deploy`
    - Compose path : `deploy/docker-compose.beelink.yml`
-   - GitOps updates : activé, mécanisme **Polling**, intervalle `5m`
+   - GitOps updates : activé, mécanisme **Webhook**. Copier l'URL affichée dans le secret GitHub `PORTAINER_WEBHOOK_URL` (Settings → Secrets and variables → Actions).
+     - GitHub Actions doit pouvoir joindre cette URL depuis Internet : n'exposer par le proxy inverse que le chemin `/api/stacks/webhooks/`, jamais toute l'interface de Portainer.
+     - À défaut, choisir le mécanisme **Polling** avec un intervalle de `5m`. Polling et Webhook s'excluent.
    - **Re-pull image** : activé (indispensable : le tag `latest` ne change pas de nom)
 4. **Variables d'environnement de la stack** :
 
@@ -63,7 +65,7 @@ Portainer ne reconstruit pas toujours une image `build:` lors d'un redéploiemen
 
 `WHOSPEAKS_DATA` doit être sur un **disque local**, jamais sur le NFS : SQLite (en mode WAL) n'y est pas fiable.
 
-Après un push, la page affiche la version et le commit de l'image dans l'en-tête, par exemple `v0.2.1 (abc1234)`. On vérifie ainsi que Portainer a redéployé. Compter jusqu'à 5 min après la fin du workflow.
+Après un push, la page affiche la version et le commit de l'image dans l'en-tête, par exemple `v0.2.1 (abc1234)`. On vérifie ainsi que Portainer a redéployé : quelques secondes après la fin du workflow avec le webhook, jusqu'à 5 min avec l'interrogation. Si l'appel du webhook échoue (URL injoignable, certificat refusé), la dernière étape du workflow passe au rouge, alors que l'image est déjà publiée.
 
 En cas de problème, le tag `:sha-<commit>` permet de revenir temporairement à une image précise, en le mettant à la place de `latest` dans la stack.
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## Non publié
+
+- Le workflow `image.yml` appelle le webhook Portainer (secret `PORTAINER_WEBHOOK_URL`) une fois la branche `deploy` avancée. Le redéploiement suit la publication de l'image en quelques secondes, au lieu d'attendre l'interrogation de Git. Sans secret, l'étape ne fait rien.
+
 ## 0.3.0
 
 ### Ajouts
