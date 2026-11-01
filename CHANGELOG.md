@@ -1,7 +1,15 @@
 # Changelog
 
-## Non publié
+## 0.4.0
 
+### Ajouts
+
+- **Enrôlement silencieux.** Pendant un enrôlement par les satellites, Jarvis ne répond plus à chaque phrase lue : WhoSpeaks renvoie un texte vide à HA, et le run se termine sur `stt-no-text-recognized`, sans appel à Ollama.
+  - Concerne toutes les phrases reçues pendant l'enrôlement, comptées ou non (un « euh » trop court ne part pas non plus vers Ollama).
+  - Les phrases comptent normalement, et restent dans le journal avec leur texte.
+  - L'événement `transcript` porte `ignored: enrolement`. Pas de mise à jour du capteur.
+  - Si l'analyse est trop lente, la décision repose sur l'état courant de l'enrôlement.
+  - Réglage `enrolement_silencieux` (défaut `true`), indépendant du filtre de silence.
 - Le workflow `image.yml` appelle le webhook Portainer (secret `PORTAINER_WEBHOOK_URL`) une fois la branche `deploy` avancée. Le redéploiement suit la publication de l'image en quelques secondes, au lieu d'attendre l'interrogation de Git. Sans secret, l'étape ne fait rien.
 
 ## 0.3.0

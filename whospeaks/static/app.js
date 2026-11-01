@@ -342,6 +342,7 @@ const FIELDS = [
   ["duree_min_enrolement", "Parole minimale en enrôlement (s)", "number", 0.1],
   ["reprise_active", "Reprendre l'interlocuteur sur les phrases trop courtes", "checkbox"],
   ["reprise_duree_s", "Durée de reprise (s, 0 à 600)", "number", 1, [0, 600]],
+  ["enrolement_silencieux", "Jarvis ne répond pas pendant un enrôlement", "checkbox"],
   ["filtre_silence_actif", "Ne rien transcrire quand personne ne parle", "checkbox"],
   ["silence_max_s", "Parole en dessous de laquelle c'est du silence (s, 0 à 2)", "number", 0.05, [0, 2]],
   ["hallucinations", "Textes inventés par Whisper à ignorer (un par ligne ; « ~ » en tête : expression régulière)", "lines"],
@@ -460,7 +461,8 @@ function renderBandeau() {
   const el = document.getElementById("enrolement");
   const e = state.etat.enrolement;
   el.hidden = !e;
-  if (e) el.replaceChildren(h("span", {}, `🎙 Enrôlement de ${e.personne} : ${e.n}/${e.total} phrases — parlez à un satellite (« Jarvis… » puis une phrase d'au moins 2 s).`),
+  const muet = state.reglages.enrolement_silencieux ? " Jarvis ne répond pas pendant l'enrôlement." : "";
+  if (e) el.replaceChildren(h("span", {}, `🎙 Enrôlement de ${e.personne} : ${e.n}/${e.total} phrases — parlez à un satellite (« Jarvis… » puis une phrase d'au moins 2 s).${muet}`),
     h("button", { onclick: () => act(() => api("DELETE", "/api/enrolement"), "Enrôlement arrêté") }, "Arrêter"));
   const s = state.etat;
   document.getElementById("statut").textContent = s.modele_charge

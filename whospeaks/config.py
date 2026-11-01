@@ -128,6 +128,8 @@ DEFAULT_SETTINGS: dict = {
     # Phrase trop courte : reprendre l'interlocuteur identifié il y a moins de N secondes.
     "reprise_active": True,
     "reprise_duree_s": 120,
+    # Pendant un enrôlement, texte vide renvoyé à HA : Jarvis ne répond pas aux phrases lues.
+    "enrolement_silencieux": True,
     # Pas de parole (VAD) ou texte inventé par Whisper : transcript vide, HA ne répond pas.
     "filtre_silence_actif": True,
     "silence_max_s": 0.3,

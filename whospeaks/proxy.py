@@ -291,12 +291,19 @@ class ProxyHandler(AsyncEventHandler):
             self._schedule_record(service, future, text, added_ms)
 
     def _filter_reason(self, analysis: Analysis | None, text: str | None) -> str | None:
-        """« silence », « hallucination » ou None si le texte doit passer."""
+        """« silence », « hallucination », « enrolement » ou None si le texte doit passer."""
         service = self.proxy.service
-        if service is None or not service.settings["filtre_silence_actif"]:
+        if service is None:
             return None
-        if analysis is not None and analysis.resultat == "ignoree_silence":
+        s = service.settings
+        if analysis is not None and analysis.resultat == "ignoree_silence" and s["filtre_silence_actif"]:
             return "silence"
+        # Analyse trop lente : on se fie à l'état courant de l'enrôlement.
+        pendant = analysis.pendant_enrolement if analysis is not None else service.enrolement is not None
+        if pendant and s["enrolement_silencieux"]:
+            return "enrolement"
+        if not s["filtre_silence_actif"]:
+            return None
         if is_hallucination(text, service.settings["hallucinations"]):
             return "hallucination"
         return None
@@ -310,8 +317,9 @@ class ProxyHandler(AsyncEventHandler):
             if fut.cancelled() or fut.exception() is not None:
                 return
             analysis = fut.result()
-            if filtered:
+            if filtered in ("silence", "hallucination"):
                 analysis.resultat = f"ignoree_{filtered}"
+            # « enrolement » : la phrase garde son résultat et compte pour l'enrôlement.
             elif analysis.resultat == "ignoree_silence":
                 # Analyse arrivée trop tard : le texte est déjà parti vers HA.
                 analysis.resultat = "trop_court"

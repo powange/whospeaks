@@ -145,7 +145,11 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
 
 ## Utilisation
 
-- **Enrôler** (onglet Personnes) : créer la personne, cliquer sur « Enrôler par les satellites », puis dire 12 phrases variées d'au moins 2 s (« Jarvis… » puis la phrase). Chaque phrase d'au moins 1,5 s est comptée, quel que soit le résultat d'identification. L'événement `whospeaks_enrolement` {personne, n, total} suit l'avancement. On peut aussi envoyer des fichiers WAV/MP3 ou enregistrer dans le navigateur (le micro du navigateur exige HTTPS ou localhost).
+- **Enrôler** (onglet Personnes) : créer la personne, cliquer sur « Enrôler par les satellites », puis dire 12 phrases variées d'au moins 2 s (« Jarvis… » puis la phrase). Chaque phrase d'au moins 1,5 s est comptée, quel que soit le résultat d'identification. L'événement `whospeaks_enrolement` {personne, n, total} suit l'avancement.
+  - **Jarvis ne répond pas pendant l'enrôlement** (réglage `enrolement_silencieux`, activé par défaut). Toute phrase reçue pendant un enrôlement, comptée ou non, renvoie un texte vide à HA : le run se termine sur `stt-no-text-recognized`, sans conversation. Les phrases restent dans le journal et comptent normalement. Une fois l'enrôlement terminé ou arrêté, Jarvis répond de nouveau.
+  - Pendant ce temps, Jarvis ne répond **à personne**, sur aucun satellite : penser à arrêter l'enrôlement s'il reste inachevé (il expire de toute façon au bout de 15 min).
+  - Sans réponse vocale, l'avancement se suit sur le bandeau de la page, ou par une automatisation sur `whospeaks_enrolement` (voir [homeassistant/whospeaks.yaml](homeassistant/whospeaks.yaml)).
+- On peut aussi envoyer des fichiers WAV/MP3 ou enregistrer dans le navigateur (le micro du navigateur exige HTTPS ou localhost).
 - **Journal** : chaque phrase, avec son résultat, son score et son extrait audio.
   - « Corriger… » attribue la phrase à une autre personne. L'éventuel échantillon automatique fautif est retiré.
   - « ✗ pas lui/elle » remet la phrase en voix inconnue.

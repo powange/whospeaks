@@ -57,6 +57,8 @@ class Analysis:
     erreur: str | None = None
     # Âge (s) de l'identification reprise, pour le résultat « reprise ».
     reprise_age: float | None = None
+    # Phrase reçue pendant un enrôlement (comptée ou non) : Jarvis ne doit pas y répondre.
+    pendant_enrolement: bool = False
     horodatage: float = field(default_factory=time.time)
     audio: np.ndarray | None = field(default=None, repr=False)
     emb: np.ndarray | None = field(default=None, repr=False)
@@ -234,12 +236,14 @@ class WhoSpeaks:
             return Analysis("erreur", duree_parole=duree, audio=audio,
                             erreur=self.model_error or "modèle non chargé")
         enrol = self._active_enrolement()
+        pendant_enrolement = enrol is not None
         if duree < s["duree_min_parole"]:
             # Pendant l'enrôlement aussi : une phrase trop courte n'est pas comptée.
             result = self._reprise(satellite) or Analysis("trop_court")
             result.duree_parole = duree
             result.audio = audio
             result.temps_empreinte_ms = (time.perf_counter() - t0) * 1000
+            result.pendant_enrolement = pendant_enrolement
             return result
         if enrol is not None and duree < s["duree_min_enrolement"]:
             enrol = None
@@ -253,6 +257,7 @@ class WhoSpeaks:
             result = Analysis(
                 "inconnu", duree_parole=duree, score=match.score, marge=match.marge,
                 temps_empreinte_ms=t_emb, audio=audio, emb=emb,
+                pendant_enrolement=pendant_enrolement,
             )
             if enrol is not None:
                 result.resultat = "enrolement"
