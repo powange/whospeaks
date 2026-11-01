@@ -36,6 +36,11 @@ _CHUNK_SECONDS = 4.0
 _MAX_EMBED_SECONDS = 10.0
 
 
+# Filtres du journal supprimables d'un coup : phrases qui n'ont rien appris au modèle
+# (ni échantillon, ni groupe de voix inconnues).
+BULK_DELETE_FILTERS = ("trop_court", "ignoree_silence", "ignoree_hallucination", "erreur")
+
+
 class ServiceError(Exception):
     """Erreur métier renvoyée telle quelle à la page."""
 
@@ -789,6 +794,25 @@ class WhoSpeaks:
         self.db.execute("DELETE FROM phrases WHERE id=?", (phrase_id,))
         self._delete_clip_if_unused(row["clip"])
         self.reload()
+
+    def _bulk_filter(self, filtre: str) -> str:
+        if filtre not in BULK_DELETE_FILTERS:
+            raise ServiceError(f"Suppression groupée impossible pour le filtre « {filtre} »")
+        return filtre
+
+    def count_phrases(self, filtre: str) -> int:
+        return self.db.one("SELECT COUNT(*) AS n FROM phrases WHERE resultat=?",
+                           (self._bulk_filter(filtre),))["n"]
+
+    def delete_phrases(self, filtre: str) -> int:
+        """Supprime toutes les phrases d'un filtre (pas seulement celles affichées)."""
+        rows = self.db.all("SELECT id, clip FROM phrases WHERE resultat=?", (self._bulk_filter(filtre),))
+        with self.db.tx() as conn:
+            conn.executemany("DELETE FROM phrases WHERE id=?", [(r["id"],) for r in rows])
+        for r in rows:
+            self._delete_clip_if_unused(r["clip"])
+        _LOGGER.info("%d phrases « %s » supprimées", len(rows), filtre)
+        return len(rows)
 
     def phrase_clip(self, phrase_id: int) -> Path:
         return self._clip_file(self._phrase(phrase_id)["clip"])

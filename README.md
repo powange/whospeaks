@@ -153,6 +153,7 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
 - **Journal** : chaque phrase, avec son résultat, son score et son extrait audio.
   - « Corriger… » attribue la phrase à une autre personne. L'éventuel échantillon automatique fautif est retiré.
   - « ✗ pas lui/elle » remet la phrase en voix inconnue.
+  - « 🗑 Tout supprimer » apparaît avec les filtres « Trop courtes », « Ignorées (silence) », « Ignorées (hallucination) » et « Erreurs ». Il supprime toutes les phrases du filtre et leur audio, y compris celles au-delà des 150 affichées, après une confirmation qui indique le nombre. Ces phrases n'ont rien appris au modèle : les filtres qui nourrissent les échantillons ou les groupes (reconnues, inconnues, attribuées, enrôlement, reprises) n'ont pas ce bouton.
 - **Voix inconnues** : groupes triés par taille, avec trois extraits chacun. On peut les attribuer, créer une personne, les fusionner, les ignorer (télé, invité) ou les supprimer. « Recalculer les groupes » relance un regroupement complet (agglomératif) en tâche de fond.
 - **Réglages** : seuils, enrichissement automatique, rétention, modèle, calibrage et sauvegarde (export ou import zip).
   - Le **calibrage** propose `seuil_identification` et `marge_min`, avec les taux d'erreur estimés par validation croisée sur les échantillons.

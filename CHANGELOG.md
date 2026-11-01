@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+### Ajouts
+
+- **Journal : « Tout supprimer »** pour les filtres « Trop courtes », « Ignorées (silence) », « Ignorées (hallucination) » et « Erreurs ». Le bouton supprime toutes les phrases du filtre et leur audio, pas seulement les 150 affichées, après confirmation du nombre. API : `GET /api/phrases/compte?filtre=…` et `DELETE /api/phrases?filtre=…`. Les autres filtres sont refusés (erreur 400).
+- Filtre « Erreurs » ajouté au menu du journal.
+
 ## 0.4.0
 
 ### Ajouts

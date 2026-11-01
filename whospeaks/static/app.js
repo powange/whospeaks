@@ -152,10 +152,10 @@ async function renderJournal() {
   const root = document.getElementById("journal");
   const phrases = await api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...(state.filtre ? { filtre: state.filtre } : {}) }));
   const filtre = h("select", { onchange: (e) => { state.filtre = e.target.value; refresh(); } },
-    [["", "Toutes les phrases"], ["identifie", "Reconnues"], ["inconnu", "Inconnues à traiter"],
-      ["attribuee", "Attribuées"], ["reprise", "Reprises"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"],
-      ["ignoree_silence", "Ignorées (silence)"], ["ignoree_hallucination", "Ignorées (hallucination)"]]
-      .map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
+    JOURNAL_FILTERS.map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
+  // Filtres sans apprentissage : leurs phrases peuvent partir d'un coup.
+  const bulk = BULK_DELETE.includes(state.filtre) && phrases.length
+    ? h("button", { class: "danger", onclick: () => deleteFiltered(state.filtre) }, "🗑 Tout supprimer") : null;
   const list = phrases.length ? phrases.map((p) => h("div", { class: "card phrase" },
     h("div", {}, h("div", {}, fmtDate(p.horodatage)),
       h("div", { class: "muted" }, [p.satellite, p.duree_parole ? `${p.duree_parole.toFixed(1)} s` : null,
@@ -170,8 +170,27 @@ async function renderJournal() {
       !p.personne_id && p.etat !== "ignoree" && p.a_empreinte ? h("button", { onclick: () => act(() => api("POST", `/api/phrases/${p.id}/ignorer`), "Ignorée") }, "Ignorer") : null,
       h("button", { class: "danger", title: "Supprimer", onclick: () => confirm("Supprimer cette phrase du journal ?") && act(() => api("DELETE", `/api/phrases/${p.id}`)) }, "🗑")))
   ) : [h("div", { class: "empty" }, "Aucune phrase pour l'instant.")];
-  root.replaceChildren(h("div", { class: "toolbar" }, filtre,
+  root.replaceChildren(h("div", { class: "toolbar" }, filtre, bulk,
     h("label", { class: "muted" }, h("input", { type: "checkbox", id: "auto", checked: autoRefresh, onchange: (e) => (autoRefresh = e.target.checked) }), " actualisation auto")), ...list);
+}
+
+const JOURNAL_FILTERS = [["", "Toutes les phrases"], ["identifie", "Reconnues"], ["inconnu", "Inconnues à traiter"],
+  ["attribuee", "Attribuées"], ["reprise", "Reprises"], ["trop_court", "Trop courtes"], ["enrolement", "Enrôlement"],
+  ["ignoree_silence", "Ignorées (silence)"], ["ignoree_hallucination", "Ignorées (hallucination)"], ["erreur", "Erreurs"]];
+const BULK_DELETE = ["trop_court", "ignoree_silence", "ignoree_hallucination", "erreur"];
+
+async function deleteFiltered(filtre) {
+  const label = JOURNAL_FILTERS.find(([v]) => v === filtre)[1];
+  try {
+    // Le nombre total, pas seulement les phrases affichées (limitées à 150).
+    const { nombre } = await api("GET", "/api/phrases/compte?" + new URLSearchParams({ filtre }));
+    if (!nombre || !confirm(`Supprimer définitivement les ${nombre} phrase(s) « ${label} » et leur audio ?`)) return;
+    const r = await api("DELETE", "/api/phrases?" + new URLSearchParams({ filtre }));
+    toast(`${r.supprimees} phrase(s) supprimée(s)`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+  refresh();
 }
 
 // --- Personnes ---

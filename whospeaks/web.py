@@ -165,6 +165,14 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
         await run(service.assign_phrase, rows[0]["id"], pid)
         return {"ok": True, "phrase_id": rows[0]["id"], "personne_id": pid}
 
+    @app.get("/api/phrases/compte", dependencies=[api])
+    async def phrases_compte(filtre: str):
+        return {"filtre": filtre, "nombre": await run(service.count_phrases, filtre)}
+
+    @app.delete("/api/phrases", dependencies=[api])
+    async def phrases_supprimer(filtre: str):
+        return {"filtre": filtre, "supprimees": await run(service.delete_phrases, filtre)}
+
     # ------------------------------------------------------------ personnes
     @app.get("/api/personnes", dependencies=[api])
     async def personnes():
