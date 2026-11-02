@@ -244,7 +244,9 @@ async function renderPersonnes() {
     const entity = h("input", { value: p.person_entity || "", placeholder: "person.xxx" });
     const card = h("div", { class: "card" },
       h("div", { class: "row" },
-        h("h2", { class: "grow" }, p.nom, " ", h("span", { class: "muted" }, `${p.echantillons} échantillons (${src})`)),
+        h("h2", { class: "grow" }, p.nom, " ",
+          h("button", { class: "icon", title: "Renommer", "aria-label": `Renommer ${p.nom}`, onclick: () => renamePerson(p) }, "✎"), " ",
+          h("span", { class: "muted" }, `${p.echantillons} échantillons (${src})`)),
         h("button", { onclick: () => { openSamples.has(p.id) ? openSamples.delete(p.id) : openSamples.add(p.id); refresh(); } }, openSamples.has(p.id) ? "Masquer" : "Échantillons"),
         h("button", { class: "danger", onclick: () => confirm(`Supprimer ${p.nom} et ses échantillons ?`) && act(() => api("DELETE", `/api/personnes/${p.id}`), "Supprimée") }, "Supprimer")),
       h("div", { class: "row" },
@@ -259,6 +261,13 @@ async function renderPersonnes() {
     cards.push(card);
   }
   root.replaceChildren(form, ...(cards.length ? cards : [h("div", { class: "empty" }, "Aucune personne. Créez-en une puis enrôlez-la.")]));
+}
+
+function renamePerson(p) {
+  const nom = prompt(`Nouveau nom pour ${p.nom} :`, p.nom);
+  if (nom === null || !nom.trim() || nom.trim() === p.nom) return;
+  // Les échantillons, phrases et la reprise suivent : ils sont liés à la personne, pas au nom.
+  act(() => api("PATCH", `/api/personnes/${p.id}`, { nom: nom.trim() }), "Personne renommée");
 }
 
 async function samplesList(pid) {

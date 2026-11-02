@@ -619,18 +619,33 @@ class WhoSpeaks:
         return int(row["id"])
 
     def update_person(self, person_id: int, nom: str | None, person_entity: str | None) -> None:
-        self._person(person_id)
+        old = self._person(person_id)["nom"]
         if nom is not None:
-            if not nom.strip():
+            nom = nom.strip()
+            if not nom:
                 raise ServiceError("Nom obligatoire")
             try:
-                self.db.execute("UPDATE personnes SET nom=? WHERE id=?", (nom.strip(), person_id))
+                self.db.execute("UPDATE personnes SET nom=? WHERE id=?", (nom, person_id))
             except sqlite3.IntegrityError as err:
                 raise ServiceError(f"« {nom} » existe déjà") from err
+            if nom != old:
+                self._renamed(old, nom, person_id)
         if person_entity is not None:
             self.db.execute("UPDATE personnes SET person_entity=? WHERE id=?",
                             (person_entity.strip() or None, person_id))
         self.reload()
+
+    def _renamed(self, old: str, new: str, person_id: int) -> None:
+        """Suit le nouveau nom là où l'ancien servait de clé."""
+        mapping = dict(self.settings.get("personnes_ha") or {})
+        if old in mapping:
+            # Correspondance nom -> person.xxx des Réglages
+            mapping[new] = mapping.pop(old)
+            self.db.save_settings({"personnes_ha": mapping})
+            self.settings["personnes_ha"] = mapping
+        if self.enrolement and self.enrolement.personne_id == person_id:
+            self.enrolement.nom = new
+        _LOGGER.info("Personne renommée : %s → %s", old, new)
 
     def delete_person(self, person_id: int) -> None:
         clips = [r["clip"] for r in self.db.all(

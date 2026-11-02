@@ -145,6 +145,7 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
 
 ## Utilisation
 
+- **Renommer** (onglet Personnes) : bouton ✎ à côté du nom. Les échantillons, les phrases du journal et la reprise suivent, car ils sont liés à la personne et non à son nom. La correspondance nom → `person.*` des Réglages et un enrôlement en cours prennent aussi le nouveau nom. Le capteur HA affiche le nouveau nom dès la phrase suivante.
 - **Enrôler** (onglet Personnes) : créer la personne, cliquer sur « Enrôler par les satellites », puis dire 12 phrases variées d'au moins 2 s (« Jarvis… » puis la phrase). Chaque phrase d'au moins 1,5 s est comptée, quel que soit le résultat d'identification. L'événement `whospeaks_enrolement` {personne, n, total} suit l'avancement.
   - **Jarvis ne répond pas pendant l'enrôlement** (réglage `enrolement_silencieux`, activé par défaut). Toute phrase reçue pendant un enrôlement, comptée ou non, renvoie un texte vide à HA : le run se termine sur `stt-no-text-recognized`, sans conversation. Les phrases restent dans le journal et comptent normalement. Une fois l'enrôlement terminé ou arrêté, Jarvis répond de nouveau.
   - Pendant ce temps, Jarvis ne répond **à personne**, sur aucun satellite : penser à arrêter l'enrôlement s'il reste inachevé (il expire de toute façon au bout de 15 min).

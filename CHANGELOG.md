@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+### Ajouts
+
+- **Renommer une personne** depuis l'onglet Personnes (bouton ✎). Les échantillons, le journal et la reprise suivent. La correspondance nom → `person.*` des Réglages et l'enrôlement en cours prennent le nouveau nom. Un nom vide ou déjà pris est refusé.
+
 ## 0.5.0
 
 ### Ajouts

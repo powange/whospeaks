@@ -110,6 +110,7 @@ td, th { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: l
 .legende span:not(.muted)::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 4px; border-radius: 2px; background: var(--ok); }
 .legende span.diff::before { background: var(--bad); opacity: .7; }
 .play { width: 34px; padding: 4px 0; }
+button.icon { padding: 0 6px; font-size: 13px; line-height: 1.6; vertical-align: middle; }
 .empty { color: var(--muted); padding: 24px; text-align: center; }
 dialog { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); }
 dialog menu { padding: 0; margin: 10px 0 0; text-align: right; }
