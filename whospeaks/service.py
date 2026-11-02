@@ -111,6 +111,16 @@ class Enrolement:
     expire: float = 0.0
 
 
+# Valeur du filtre « satellite » pour les phrases dont le satellite est inconnu
+SATELLITE_INCONNU = "?"
+
+
+def _satellite_clause(satellite: str, prefix: str = "") -> tuple[str, list]:
+    if satellite == SATELLITE_INCONNU:
+        return f"{prefix}satellite IS NULL", []
+    return f"{prefix}satellite=?", [satellite]
+
+
 def _now_iso(ts: float | None = None) -> str:
     return dt.datetime.fromtimestamp(ts or time.time()).astimezone().isoformat(timespec="seconds")
 
@@ -355,8 +365,12 @@ class WhoSpeaks:
         transcript: str | None,
         satellite: str | None = None,
         temps_ajoute_ms: float | None = None,
+        satellite_entity: str | None = None,
     ) -> int:
-        """Enregistre la phrase dans le journal (après le renvoi du transcript)."""
+        """Enregistre la phrase dans le journal (après le renvoi du transcript).
+
+        `satellite` : pièce (ou nom) affichée ; `satellite_entity` : entité HA ou identifiant.
+        """
         s = self.settings
         etat = "ignoree" if analysis.ignoree else "nouvelle"
         if analysis.resultat in ("identifie", "enrolement"):
@@ -371,11 +385,12 @@ class WhoSpeaks:
             analysis.person_id = None
         model = self.embedder.key if self.embedder else None
         cur = self.db.execute(
-            "INSERT INTO phrases(horodatage, satellite, transcript, resultat, personne_id, score, "
-            "marge, cluster_id, duree_parole, empreinte, modele, etat, temps_empreinte_ms, "
-            "temps_ajoute_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO phrases(horodatage, satellite, satellite_entity, transcript, resultat, "
+            "personne_id, score, marge, cluster_id, duree_parole, empreinte, modele, etat, "
+            "temps_empreinte_ms, temps_ajoute_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                analysis.horodatage, satellite, transcript, analysis.resultat, analysis.person_id,
+                analysis.horodatage, satellite, satellite_entity, transcript, analysis.resultat,
+                analysis.person_id,
                 analysis.score, analysis.marge, analysis.cluster_id, analysis.duree_parole,
                 None if analysis.emb is None else to_blob(analysis.emb),
                 model if analysis.emb is not None else None, etat,
@@ -458,7 +473,8 @@ class WhoSpeaks:
         if not used:
             (self.config.data_dir / clip).unlink(missing_ok=True)
 
-    def ha_payload(self, analysis: Analysis, transcript: str | None) -> dict:
+    def ha_payload(self, analysis: Analysis, transcript: str | None, satellite: str | None = None,
+                   satellite_entity: str | None = None) -> dict:
         cluster = None
         if analysis.cluster_id is not None:
             cluster = self.cluster_name(analysis.cluster_id)
@@ -475,6 +491,8 @@ class WhoSpeaks:
                 "duree_parole": round(analysis.duree_parole, 2),
                 "resultat": analysis.resultat,
                 "reprise": analysis.resultat == "reprise",
+                "satellite": satellite,
+                "satellite_entity": satellite_entity,
                 "age_s": None if analysis.reprise_age is None else round(analysis.reprise_age, 1),
                 "transcript": transcript,
                 "horodatage": _now_iso(analysis.horodatage),
@@ -663,17 +681,24 @@ class WhoSpeaks:
         self.reload()
 
     # ------------------------------------------------------------------ journal
-    def list_phrases(self, limit: int = 100, offset: int = 0, filtre: str | None = None) -> list[dict]:
-        where, params = "", []
+    def list_phrases(self, limit: int = 100, offset: int = 0, filtre: str | None = None,
+                     satellite: str | None = None) -> list[dict]:
+        clauses, params = [], []
         if filtre == "inconnu":
-            where = "WHERE p.resultat='inconnu' AND p.etat='nouvelle'"
+            clauses.append("p.resultat='inconnu' AND p.etat='nouvelle'")
         elif filtre in ("identifie", "trop_court", "enrolement", "reprise", "erreur",
                         "ignoree_silence", "ignoree_hallucination"):
-            where, params = "WHERE p.resultat=?", [filtre]
+            clauses.append("p.resultat=?")
+            params.append(filtre)
         elif filtre == "attribuee":
-            where = "WHERE p.etat='attribuee'"
+            clauses.append("p.etat='attribuee'")
+        if satellite:
+            clause, values = _satellite_clause(satellite, "p.")
+            clauses.append(clause)
+            params.extend(values)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.all(
-            f"SELECT p.id, p.horodatage, p.satellite, p.transcript, p.resultat, p.personne_id, "
+            f"SELECT p.id, p.horodatage, p.satellite, p.satellite_entity, p.transcript, p.resultat, p.personne_id, "
             f"p.score, p.marge, p.cluster_id, p.duree_parole, p.clip, p.etat, p.empreinte IS NOT NULL "
             f"AS a_empreinte, p.temps_empreinte_ms, p.temps_ajoute_ms, pe.nom, c.nom AS cluster_nom "
             f"FROM phrases p LEFT JOIN personnes pe ON pe.id=p.personne_id "
@@ -800,19 +825,51 @@ class WhoSpeaks:
             raise ServiceError(f"Suppression groupée impossible pour le filtre « {filtre} »")
         return filtre
 
-    def count_phrases(self, filtre: str) -> int:
-        return self.db.one("SELECT COUNT(*) AS n FROM phrases WHERE resultat=?",
-                           (self._bulk_filter(filtre),))["n"]
+    def _bulk_where(self, filtre: str, satellite: str | None) -> tuple[str, list]:
+        sql, params = "resultat=?", [self._bulk_filter(filtre)]
+        if satellite:
+            clause, values = _satellite_clause(satellite)
+            sql += f" AND {clause}"
+            params.extend(values)
+        return sql, params
 
-    def delete_phrases(self, filtre: str) -> int:
+    def count_phrases(self, filtre: str, satellite: str | None = None) -> int:
+        where, params = self._bulk_where(filtre, satellite)
+        return self.db.one(f"SELECT COUNT(*) AS n FROM phrases WHERE {where}", params)["n"]
+
+    def delete_phrases(self, filtre: str, satellite: str | None = None) -> int:
         """Supprime toutes les phrases d'un filtre (pas seulement celles affichées)."""
-        rows = self.db.all("SELECT id, clip FROM phrases WHERE resultat=?", (self._bulk_filter(filtre),))
+        where, params = self._bulk_where(filtre, satellite)
+        rows = self.db.all(f"SELECT id, clip FROM phrases WHERE {where}", params)
         with self.db.tx() as conn:
             conn.executemany("DELETE FROM phrases WHERE id=?", [(r["id"],) for r in rows])
         for r in rows:
             self._delete_clip_if_unused(r["clip"])
         _LOGGER.info("%d phrases « %s » supprimées", len(rows), filtre)
         return len(rows)
+
+    def satellite_stats(self, hours: float = 24) -> list[dict]:
+        """Par satellite connu : phrases et phrases ignorées des dernières `hours` heures.
+
+        « Ignorées » : silence, hallucination ou trop courtes, pour repérer un micro qui se
+        réveille tout seul. Le satellite inconnu est noté None.
+        """
+        since = time.time() - hours * 3600
+        recent = {
+            r["satellite"]: (r["total"], r["ignorees"])
+            for r in self.db.all(
+                "SELECT satellite, COUNT(*) AS total, "
+                "SUM(resultat IN ('ignoree_silence', 'ignoree_hallucination', 'trop_court')) AS ignorees "
+                "FROM phrases WHERE horodatage >= ? GROUP BY satellite", (since,),
+            )
+        }
+        known = [r["satellite"] for r in self.db.all("SELECT DISTINCT satellite FROM phrases")]
+        known.sort(key=lambda sat: (sat is None, (sat or "").casefold()))
+        return [
+            {"satellite": sat, "total_24h": recent.get(sat, (0, 0))[0],
+             "ignorees_24h": recent.get(sat, (0, 0))[1] or 0}
+            for sat in known
+        ]
 
     def phrase_clip(self, phrase_id: int) -> Path:
         return self._clip_file(self._phrase(phrase_id)["clip"])

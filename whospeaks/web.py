@@ -124,8 +124,15 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
 
     # -------------------------------------------------------------- journal
     @app.get("/api/phrases", dependencies=[api])
-    async def phrases(limit: int = 100, offset: int = 0, filtre: str | None = None):
-        return await run(service.list_phrases, min(limit, 500), offset, filtre)
+    async def phrases(limit: int = 100, offset: int = 0, filtre: str | None = None,
+                      satellite: str | None = None):
+        # satellite : pièce ou nom affiché, « ? » pour les phrases au satellite inconnu
+        return await run(service.list_phrases, min(limit, 500), offset, filtre, satellite)
+
+    @app.get("/api/satellites", dependencies=[api])
+    async def satellites():
+        """Satellites connus, avec phrases et phrases ignorées des dernières 24 h."""
+        return await run(service.satellite_stats)
 
     @app.get("/api/phrases/{phrase_id}/audio", dependencies=[api])
     async def phrase_audio(phrase_id: int):
@@ -166,12 +173,12 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
         return {"ok": True, "phrase_id": rows[0]["id"], "personne_id": pid}
 
     @app.get("/api/phrases/compte", dependencies=[api])
-    async def phrases_compte(filtre: str):
-        return {"filtre": filtre, "nombre": await run(service.count_phrases, filtre)}
+    async def phrases_compte(filtre: str, satellite: str | None = None):
+        return {"filtre": filtre, "nombre": await run(service.count_phrases, filtre, satellite)}
 
     @app.delete("/api/phrases", dependencies=[api])
-    async def phrases_supprimer(filtre: str):
-        return {"filtre": filtre, "supprimees": await run(service.delete_phrases, filtre)}
+    async def phrases_supprimer(filtre: str, satellite: str | None = None):
+        return {"filtre": filtre, "supprimees": await run(service.delete_phrases, filtre, satellite)}
 
     # ------------------------------------------------------------ personnes
     @app.get("/api/personnes", dependencies=[api])

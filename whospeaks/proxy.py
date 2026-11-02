@@ -17,7 +17,7 @@ from wyoming.server import AsyncEventHandler
 
 from . import __version__
 from .filters import is_hallucination
-from .ha import HomeAssistant
+from .ha import SATELLITE_TIMEOUT, HomeAssistant
 from .service import Analysis, WhoSpeaks
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,6 +48,20 @@ class Proxy:
         self._info: Info | None = None
         self._info_time = 0.0
         self._context_logged = False
+        self._last_source: str | None = None
+        # Enregistrements en cours : référence gardée jusqu'à la fin (la connexion peut être fermée)
+        self._background: set[asyncio.Task] = set()
+
+    def keep(self, task: asyncio.Task) -> None:
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def log_satellite_source(self, source: str, satellite: str | None) -> None:
+        """Indique d'où vient le satellite (context, ha ou inconnu), à chaque changement."""
+        if source == self._last_source:
+            return
+        self._last_source = source
+        _LOGGER.info("satellite source: %s%s", source, f" ({satellite})" if satellite else "")
 
     def log_context(self, context: dict) -> None:
         """Indique une seule fois si HA envoie un contexte (satellite) dans `transcribe`.
@@ -114,7 +128,12 @@ class ProxyHandler(AsyncEventHandler):
         self.upstream_task: asyncio.Task | None = None
         self.converter = AudioChunkConverter(rate=16000, width=2, channels=1)
         self.audio = bytearray()
+        # Satellite de la phrase : pièce (ou nom) affichée, clé (entité HA ou identifiant du
+        # contexte) et origine : « context », « ha » ou « inconnu » (None : pas encore connue)
         self.satellite: str | None = None
+        self.satellite_entity: str | None = None
+        self.satellite_source: str | None = None
+        self.satellite_task: asyncio.Task | None = None
         self.analysis_future: asyncio.Future | None = None
         self.silence_task: asyncio.Task | None = None
         # Un transcript a déjà été renvoyé pour cette phrase : la suite de l'amont est ignorée.
@@ -130,12 +149,16 @@ class ProxyHandler(AsyncEventHandler):
         if Transcribe.is_type(event.type):
             context = event.data.get("context") or {}
             self.proxy.log_context(context)
-            self.satellite = context.get("satellite_id") or context.get("device_id") or self.satellite
+            from_context = context.get("satellite_id") or context.get("device_id")
+            if from_context:
+                # Le contexte de HA reste prioritaire s'il est fourni
+                self._set_satellite(str(from_context), str(from_context), "context")
 
         if AudioStart.is_type(event.type):
             self.audio.clear()
             self.analysis_future = None
             self.replied = False
+            self._ask_satellite()
 
         if self.upstream is None and not await self._connect_upstream():
             await self.write_event(Error(text="Serveur STT amont injoignable", code="upstream").event())
@@ -166,17 +189,56 @@ class ProxyHandler(AsyncEventHandler):
         self.upstream_task = asyncio.create_task(self._read_upstream(client), name="whospeaks upstream")
         return True
 
+    # -------------------------------------------------------------- satellite
+    def _set_satellite(self, label: str | None, entity: str | None, source: str) -> None:
+        self.satellite, self.satellite_entity, self.satellite_source = label, entity, source
+        self.proxy.log_satellite_source(source, label)
+
+    def _ask_satellite(self) -> None:
+        """Début de phrase : demande à HA quel satellite écoute, sans retarder l'audio."""
+        if self.satellite_source == "context":
+            return
+        self.satellite = self.satellite_entity = self.satellite_source = None
+        ha = self.proxy.ha
+        self.satellite_task = asyncio.create_task(ha.active_satellite(), name="whospeaks satellite") \
+            if ha is not None and ha.enabled else None
+
+    async def _resolve_satellite(self, timeout: float) -> None:
+        """Attend la réponse de HA au plus `timeout` secondes (0 : seulement si déjà là)."""
+        if self.satellite_source is not None:
+            return
+        task = self.satellite_task
+        if task is None:
+            self._set_satellite(None, None, "inconnu")
+            return
+        try:
+            found = await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError:
+            return  # pas encore de réponse : peut-être plus tard
+        except Exception:  # noqa: BLE001
+            found = None
+        if found:
+            self._set_satellite(found["piece"] or found["nom"] or found["entity_id"], found["entity_id"], "ha")
+        else:
+            self._set_satellite(None, None, "inconnu")
+
     def _start_analysis(self) -> None:
         service = self.proxy.service
         if service is None or not self.audio:
             return
-        pcm = bytes(self.audio)
-        loop = asyncio.get_running_loop()
-        self.analysis_future = loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
-                                                    self.satellite)
+        self.analysis_future = asyncio.ensure_future(self._analyze(service, bytes(self.audio)))
         if service.settings["filtre_silence_actif"]:
             self.silence_task = asyncio.create_task(self._reply_if_silence(self.analysis_future),
                                                     name="whospeaks silence")
+
+    async def _analyze(self, service: WhoSpeaks, pcm: bytes) -> Analysis:
+        # Clé de la reprise : le satellite s'il est déjà connu. En pratique HA a répondu
+        # (demandé au début de la phrase) ; sinon, pas d'attente : HA lent ou coupé ne doit
+        # pas retarder l'identification, et la reprise passe par l'entrée globale.
+        await self._resolve_satellite(0)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
+                                          self.satellite_entity)
 
     async def _reply_if_silence(self, future: asyncio.Future) -> None:
         """Pas de parole : texte vide tout de suite, sans attendre Whisper.
@@ -262,7 +324,9 @@ class ProxyHandler(AsyncEventHandler):
 
         if service is not None and self.proxy.ha is not None:
             try:
-                payload = service.ha_payload(analysis or Analysis("erreur"), text)
+                await self._resolve_satellite(0)  # sans attendre : la réponse ne doit pas tarder
+                payload = service.ha_payload(analysis or Analysis("erreur"), text, self.satellite,
+                                             self.satellite_entity)
                 await self.proxy.ha.publish(payload)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Notification HA en échec")
@@ -310,23 +374,27 @@ class ProxyHandler(AsyncEventHandler):
 
     def _schedule_record(self, service: WhoSpeaks, future: asyncio.Future, text: str | None,
                          added_ms: float | None, filtered: str | None = None) -> None:
-        loop = asyncio.get_running_loop()
-        satellite = self.satellite
+        self.proxy.keep(asyncio.create_task(self._record(service, future, text, added_ms, filtered),
+                                            name="whospeaks record"))
 
-        def done(fut: asyncio.Future) -> None:
-            if fut.cancelled() or fut.exception() is not None:
-                return
-            analysis = fut.result()
-            if filtered in ("silence", "hallucination"):
-                analysis.resultat = f"ignoree_{filtered}"
-            # « enrolement » : la phrase garde son résultat et compte pour l'enrôlement.
-            elif analysis.resultat == "ignoree_silence":
-                # Analyse arrivée trop tard : le texte est déjà parti vers HA.
-                analysis.resultat = "trop_court"
-            loop.run_in_executor(self.proxy.record_pool, _safe_record, service, analysis, text,
-                                 satellite, added_ms)
-
-        future.add_done_callback(done)
+    async def _record(self, service: WhoSpeaks, future: asyncio.Future, text: str | None,
+                      added_ms: float | None, filtered: str | None) -> None:
+        try:
+            analysis: Analysis = await asyncio.shield(future)
+        except Exception:  # noqa: BLE001
+            return
+        if filtered in ("silence", "hallucination"):
+            analysis.resultat = f"ignoree_{filtered}"
+        # « enrolement » : la phrase garde son résultat et compte pour l'enrôlement.
+        elif analysis.resultat == "ignoree_silence":
+            # Analyse arrivée trop tard : le texte est déjà parti vers HA.
+            analysis.resultat = "trop_court"
+        # Le transcript est déjà parti : on peut attendre HA plus longtemps pour le journal.
+        await self._resolve_satellite(SATELLITE_TIMEOUT)
+        await asyncio.get_running_loop().run_in_executor(
+            self.proxy.record_pool, _safe_record, service, analysis, text, self.satellite, added_ms,
+            self.satellite_entity,
+        )
 
     async def disconnect(self) -> None:
         for task in (self.upstream_task, self.silence_task):
@@ -342,8 +410,8 @@ class ProxyHandler(AsyncEventHandler):
 
 
 def _safe_record(service: WhoSpeaks, analysis: Analysis, text: str | None, satellite: str | None,
-                 added_ms: float | None) -> None:
+                 added_ms: float | None, satellite_entity: str | None = None) -> None:
     try:
-        service.record(analysis, text, satellite, added_ms)
+        service.record(analysis, text, satellite, added_ms, satellite_entity)
     except Exception:  # noqa: BLE001
         _LOGGER.exception("Enregistrement de la phrase impossible")

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+### Ajouts
+
+- **Satellite d'origine de chaque phrase.** HA ne l'envoie pas dans `transcribe`, WhoSpeaks le lui demande au début de chaque phrase (`POST /api/template` : entité `assist_satellite.*` en écoute, la plus récente s'il y en a plusieurs). Le contexte HA reste prioritaire s'il arrive un jour.
+  - La requête part en tâche de fond pendant l'audio, sans retarder Whisper ni la réponse. HA lent ou coupé donne un satellite inconnu (« ? »). Délai de 1 s, avertissement au plus une fois par minute.
+  - Journal : pièce (ou nom du satellite) dans `phrases.satellite`, entité dans la nouvelle colonne `phrases.satellite_entity` (ajoutée aux bases existantes au démarrage).
+  - Capteur `sensor.jarvis_interlocuteur` et événement `jarvis_interlocuteur` : attributs `satellite` et `satellite_entity`.
+  - La reprise de l'interlocuteur est désormais réellement gardée par satellite (clé : l'entité).
+  - Page Journal : badge du satellite en tête de chaque phrase, filtre par satellite (aussi appliqué à « Tout supprimer »), et phrases ignorées par satellite sur 24 h (surligné au-delà de la moitié).
+  - API : paramètre `satellite` sur `GET /api/phrases`, `GET /api/phrases/compte` et `DELETE /api/phrases` (`?` : satellite inconnu) ; nouveau `GET /api/satellites`.
+  - Journal du service : `satellite source: context|ha|inconnu` à chaque changement d'origine.
+
 ## 0.4.1
 
 ### Ajouts

@@ -127,7 +127,7 @@ Si l'on change de modèle, toutes les empreintes sont recalculées à partir de 
 1. **Intégration** : ajouter une intégration Wyoming vers `192.168.0.11:10302`, puis choisir ce moteur STT dans le pipeline Jarvis. L'ancien `10301` reste disponible en secours.
 2. **Capteur** : `sensor.jarvis_interlocuteur` est créé au premier message.
    - État : nom de la personne, `inconnu` ou `trop court`.
-   - Attributs : `person_entity`, `score`, `marge`, `cluster`, `transcript`, `horodatage`, `duree_parole`, `resultat`, `reprise`, `age_s` (voir « Comment une phrase est classée »).
+   - Attributs : `person_entity`, `score`, `marge`, `cluster`, `transcript`, `horodatage`, `duree_parole`, `resultat`, `reprise`, `age_s` (voir « Comment une phrase est classée »), `satellite` et `satellite_entity` (voir « Satellite d'origine »).
 3. **Événement** : `jarvis_interlocuteur` porte les mêmes données, avec `interlocuteur` pour le nom. Les deux messages partent **avant** le renvoi du texte.
 4. **Prompt Ollama** : utiliser `last_updated` plutôt que `last_changed`. Si la même personne parle deux fois de suite, l'état ne change pas, donc `last_changed` non plus, alors que `last_updated` suit l'attribut `horodatage`.
    ```jinja
@@ -150,7 +150,9 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
   - Pendant ce temps, Jarvis ne répond **à personne**, sur aucun satellite : penser à arrêter l'enrôlement s'il reste inachevé (il expire de toute façon au bout de 15 min).
   - Sans réponse vocale, l'avancement se suit sur le bandeau de la page, ou par une automatisation sur `whospeaks_enrolement` (voir [homeassistant/whospeaks.yaml](homeassistant/whospeaks.yaml)).
 - On peut aussi envoyer des fichiers WAV/MP3 ou enregistrer dans le navigateur (le micro du navigateur exige HTTPS ou localhost).
-- **Journal** : chaque phrase, avec son résultat, son score et son extrait audio.
+- **Journal** : chaque phrase, avec son satellite (badge en tête, « ? » s'il est inconnu), son résultat, son score et son extrait audio.
+  - Filtre par satellite, combinable avec le filtre de résultat (API : `GET /api/phrases?satellite=Salon`, `?` pour les inconnus).
+  - Au-dessus de la liste : pour chaque satellite, les phrases ignorées (silence, hallucination, trop courtes) sur les dernières 24 h. Un satellite dont plus de la moitié des phrases sont ignorées, avec au moins 5 phrases, est surligné : c'est le micro qui se réveille tout seul. API : `GET /api/satellites`.
   - « Corriger… » attribue la phrase à une autre personne. L'éventuel échantillon automatique fautif est retiré.
   - « ✗ pas lui/elle » remet la phrase en voix inconnue.
   - « 🗑 Tout supprimer » apparaît avec les filtres « Trop courtes », « Ignorées (silence) », « Ignorées (hallucination) » et « Erreurs ». Il supprime toutes les phrases du filtre et leur audio, y compris celles au-delà des 150 affichées, après une confirmation qui indique le nombre. Ces phrases n'ont rien appris au modèle : les filtres qui nourrissent les échantillons ou les groupes (reconnues, inconnues, attribuées, enrôlement, reprises) n'ont pas ce bouton.
@@ -172,7 +174,7 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
    - **reprise** : si une personne a été identifiée (ou enrôlée) il y a moins de `reprise_duree_s` (120 s), la phrase lui est attribuée avec le résultat `reprise`. Le capteur garde donc le prénom sur « stop » ou « allume la lumière » au milieu d'un échange.
      - Aucune empreinte n'est calculée, et la phrase ne devient jamais un échantillon : ni automatique, ni d'enrôlement, ni par « Corriger… », qui ne change que l'étiquette.
      - La mémoire n'est pas rafraîchie par une reprise : une suite de phrases courtes ne prolonge pas le délai.
-     - Elle est gardée par satellite quand HA indique le satellite dans l'événement `transcribe` (pas de reprise d'un satellite à l'autre), et sinon globalement. Le journal affiche une fois `satellite context: present/absent` à la première phrase reçue. Les versions actuelles de HA n'envoient pas ce contexte : c'est alors l'entrée globale qui sert.
+     - Elle est gardée par satellite (voir « Satellite d'origine ») : pas de reprise d'un satellite à l'autre. Si le satellite est inconnu, c'est l'entrée globale qui sert.
      - Le capteur porte `reprise: true` et `age_s`, l'âge en secondes de l'identification reprise. Les autres résultats portent `reprise: false`.
      - Se désactive avec `reprise_active` dans les Réglages.
    - sinon : `trop court`, sans regroupement.
@@ -181,6 +183,18 @@ Une seule exception : quand personne n'a parlé, ou quand Whisper a inventé un 
    - elle est comparée à la liste à ignorer (`seuil_ignore`) ;
    - sinon, elle rejoint le groupe le plus proche (`seuil_cluster`, 0,6), ou en crée un nouveau.
 4. Si le score dépasse `seuil_auto` (0,75) et la marge 0,15, la phrase devient un échantillon `auto`. Au-delà de `max_echantillons` (200), on retire les échantillons les plus redondants, les automatiques en premier.
+
+### Satellite d'origine
+
+Home Assistant n'indique pas à WhoSpeaks quel satellite a capté la phrase : l'intégration Wyoming n'envoie que la langue dans l'événement `transcribe`. WhoSpeaks le retrouve dans cet ordre :
+
+1. **Contexte HA** : `satellite_id` ou `device_id` dans l'événement `transcribe`, s'il est fourni un jour (prioritaire).
+2. **HA** : au début de chaque phrase, un `POST /api/template` demande quelle entité `assist_satellite.*` est en `listening` ou en `processing`. S'il y en a plusieurs, c'est la plus récemment changée. Les satellites de l'app Wyoming VBAN Satellite sont de vrais satellites Wyoming : HA crée bien ces entités.
+3. **Inconnu** sinon : le journal affiche « ? ».
+
+- Le journal enregistre la **pièce** de l'entité si elle en a une (`Salon`), sinon son nom, dans `phrases.satellite`. L'entité elle-même va dans `phrases.satellite_entity`.
+- La requête part en tâche de fond pendant que l'audio arrive. Elle ne retarde ni le relais vers Whisper ni la réponse : HA lent ou coupé donne simplement « ? ». Délai maximum : 1 s pour le journal. Le capteur prend le satellite s'il est déjà connu au moment de répondre, ce qui est le cas en pratique.
+- En cas d'échec, un avertissement est journalisé au plus une fois par minute. Le journal indique aussi l'origine à chaque changement : `satellite source: context|ha|inconnu`.
 
 ## Évaluer les modèles
 

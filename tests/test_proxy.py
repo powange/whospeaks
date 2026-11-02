@@ -1,4 +1,5 @@
 import asyncio
+import json
 import statistics
 import time
 from pathlib import Path
@@ -62,11 +63,19 @@ class FakeWhisper:
 
 
 class FakeHA:
-    def __init__(self):
+    """Faux HA : `calls` reçoit capteur et événements ; `/api/template` (satellite actif)
+    répond avec `satellite` (dict ou None), compté à part dans `template_calls`."""
+
+    def __init__(self, satellite=None):
         self.calls = []
+        self.template_calls = 0
+        self.satellite = satellite
 
     def transport(self):
         def handler(request: httpx.Request):
+            if request.url.path == "/api/template":
+                self.template_calls += 1
+                return httpx.Response(200, text=json.dumps(self.satellite) if self.satellite else "")
             self.calls.append((time.perf_counter(), request.url.path, request.read()))
             return httpx.Response(200, json={})
         return httpx.MockTransport(handler)
@@ -102,8 +111,8 @@ async def whisper():
     w.server.close()
 
 
-def fake_ha():
-    fake = FakeHA()
+def fake_ha(satellite=None):
+    fake = FakeHA(satellite)
     ha = HomeAssistant("http://ha.test", "jeton", "sensor.jarvis_interlocuteur", "jarvis_interlocuteur")
     ha._client = httpx.AsyncClient(base_url="http://ha.test", transport=fake.transport())
     return fake, ha

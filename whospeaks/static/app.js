@@ -8,7 +8,7 @@ try {
   else token = localStorage.getItem("whospeaks_token") || "";
 } catch (e) { /* stockage indisponible : on garde le jeton en mémoire */ }
 
-const state = { personnes: [], groupes: [], reglages: {}, etat: {}, tab: "journal", filtre: "" };
+const state = { personnes: [], groupes: [], reglages: {}, etat: {}, tab: "journal", filtre: "", satellite: "" };
 
 function url(path, extra = {}) {
   const q = new URLSearchParams(extra);
@@ -150,17 +150,24 @@ function resultBadge(p) {
 // --- Journal ---
 async function renderJournal() {
   const root = document.getElementById("journal");
-  const phrases = await api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...(state.filtre ? { filtre: state.filtre } : {}) }));
+  const [phrases, satellites] = await Promise.all([
+    api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...journalParams() })),
+    api("GET", "/api/satellites"),
+  ]);
   const filtre = h("select", { onchange: (e) => { state.filtre = e.target.value; refresh(); } },
     JOURNAL_FILTERS.map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
+  // Satellite : pièce ou nom ; « ? » pour les phrases dont le satellite est inconnu
+  const satFilter = h("select", { title: "Satellite", onchange: (e) => { state.satellite = e.target.value; refresh(); } },
+    h("option", { value: "" }, "Tous les satellites"),
+    satellites.map((x) => h("option", { value: x.satellite ?? "?", selected: state.satellite === (x.satellite ?? "?") }, x.satellite ?? "? (inconnu)")));
   // Filtres sans apprentissage : leurs phrases peuvent partir d'un coup.
   const bulk = BULK_DELETE.includes(state.filtre) && phrases.length
     ? h("button", { class: "danger", onclick: () => deleteFiltered(state.filtre) }, "🗑 Tout supprimer") : null;
   const list = phrases.length ? phrases.map((p) => h("div", { class: "card phrase" },
     h("div", {}, h("div", {}, fmtDate(p.horodatage)),
-      h("div", { class: "muted" }, [p.satellite, p.duree_parole ? `${p.duree_parole.toFixed(1)} s` : null,
+      h("div", { class: "muted" }, [p.duree_parole ? `${p.duree_parole.toFixed(1)} s` : null,
         p.temps_ajoute_ms !== null ? `+${Math.round(p.temps_ajoute_ms)} ms` : null].filter(Boolean).join(" · "))),
-    h("div", { class: "grow" }, h("div", {}, resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—")),
+    h("div", { class: "grow" }, h("div", { class: "row" }, satelliteBadge(p), resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—")),
     h("div", { class: "actions" },
       p.audio ? playButton(`/api/phrases/${p.id}/audio`) : null,
       p.resultat === "reprise" || ((p.a_empreinte || p.audio) && !["trop_court", "ignoree_silence"].includes(p.resultat))
@@ -170,8 +177,29 @@ async function renderJournal() {
       !p.personne_id && p.etat !== "ignoree" && p.a_empreinte ? h("button", { onclick: () => act(() => api("POST", `/api/phrases/${p.id}/ignorer`), "Ignorée") }, "Ignorer") : null,
       h("button", { class: "danger", title: "Supprimer", onclick: () => confirm("Supprimer cette phrase du journal ?") && act(() => api("DELETE", `/api/phrases/${p.id}`)) }, "🗑")))
   ) : [h("div", { class: "empty" }, "Aucune phrase pour l'instant.")];
-  root.replaceChildren(h("div", { class: "toolbar" }, filtre, bulk,
-    h("label", { class: "muted" }, h("input", { type: "checkbox", id: "auto", checked: autoRefresh, onchange: (e) => (autoRefresh = e.target.checked) }), " actualisation auto")), ...list);
+  root.replaceChildren(h("div", { class: "toolbar" }, filtre, satFilter, bulk,
+    h("label", { class: "muted" }, h("input", { type: "checkbox", id: "auto", checked: autoRefresh, onchange: (e) => (autoRefresh = e.target.checked) }), " actualisation auto")),
+    satelliteStats(satellites), ...list);
+}
+
+function journalParams() {
+  return { ...(state.filtre ? { filtre: state.filtre } : {}), ...(state.satellite ? { satellite: state.satellite } : {}) };
+}
+
+function satelliteBadge(p) {
+  return h("span", { class: "badge sat", title: p.satellite_entity || "satellite inconnu" }, p.satellite || "?");
+}
+
+// Phrases ignorées par satellite sur 24 h : un micro qui se réveille tout seul saute aux yeux
+function satelliteStats(satellites) {
+  const recent = satellites.filter((x) => x.total_24h > 0);
+  if (!recent.length) return null;
+  return h("div", { class: "stats muted" }, "Dernières 24 h, phrases ignorées (silence, hallucination, trop courtes) : ",
+    recent.map((x) => {
+      const suspect = x.ignorees_24h >= 5 && x.ignorees_24h >= x.total_24h / 2;
+      return h("span", { class: "badge " + (suspect ? "warn" : "none"), title: `${x.ignorees_24h} ignorée(s) sur ${x.total_24h} phrase(s)` },
+        `${x.satellite ?? "?"} : ${x.ignorees_24h} / ${x.total_24h}`);
+    }));
 }
 
 const JOURNAL_FILTERS = [["", "Toutes les phrases"], ["identifie", "Reconnues"], ["inconnu", "Inconnues à traiter"],
@@ -183,9 +211,12 @@ async function deleteFiltered(filtre) {
   const label = JOURNAL_FILTERS.find(([v]) => v === filtre)[1];
   try {
     // Le nombre total, pas seulement les phrases affichées (limitées à 150).
-    const { nombre } = await api("GET", "/api/phrases/compte?" + new URLSearchParams({ filtre }));
-    if (!nombre || !confirm(`Supprimer définitivement les ${nombre} phrase(s) « ${label} » et leur audio ?`)) return;
-    const r = await api("DELETE", "/api/phrases?" + new URLSearchParams({ filtre }));
+    // Le filtre satellite s'applique aussi : on ne supprime que ce qui est affiché comme filtré
+    const query = new URLSearchParams({ filtre, ...(state.satellite ? { satellite: state.satellite } : {}) });
+    const where = state.satellite ? ` du satellite « ${state.satellite} »` : "";
+    const { nombre } = await api("GET", "/api/phrases/compte?" + query);
+    if (!nombre || !confirm(`Supprimer définitivement les ${nombre} phrase(s) « ${label} »${where} et leur audio ?`)) return;
+    const r = await api("DELETE", "/api/phrases?" + query);
     toast(`${r.supprimees} phrase(s) supprimée(s)`);
   } catch (e) {
     toast(e.message, true);

@@ -1,6 +1,6 @@
 [project]
 name = "whospeaks"
-version = "0.4.1"
+version = "0.5.0"
 description = "Reconnaissance du locuteur pour Home Assistant (proxy STT Wyoming)"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.23"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "jinja2>=3.1"]
 
 [project.scripts]
 whospeaks = "whospeaks.__main__:main"

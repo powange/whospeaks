@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS clusters (
 CREATE TABLE IF NOT EXISTS phrases (
     id INTEGER PRIMARY KEY,
     horodatage REAL NOT NULL,
+    -- Pièce du satellite (ou son nom) ; entité HA (assist_satellite.…) ou identifiant du contexte
     satellite TEXT,
+    satellite_entity TEXT,
     transcript TEXT,
     -- identifie | inconnu | trop_court | enrolement | reprise | erreur
     -- | ignoree_silence | ignoree_hallucination
@@ -84,6 +86,21 @@ CREATE TABLE IF NOT EXISTS reglages (
 """
 
 
+# Colonnes ajoutées après coup : (table, colonne, définition). CREATE TABLE IF NOT EXISTS
+# ne touche pas une base existante, elles y sont donc ajoutées ici.
+MIGRATIONS = [
+    ("phrases", "satellite_entity", "TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, definition in MIGRATIONS:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            _LOGGER.info("Base : colonne %s.%s ajoutée", table, column)
+
+
 def to_blob(vec: np.ndarray) -> bytes:
     return np.asarray(vec, dtype="<f4").tobytes()
 
@@ -126,6 +143,7 @@ class Database:
             conn.close()
             raise sqlite3.DatabaseError(f"quick_check : {result}")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         return conn
 
     def reopen(self) -> None:

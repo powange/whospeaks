@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 
 import httpx
 
 _LOGGER = logging.getLogger(__name__)
+
+# Satellite qui écoute en ce moment (le plus récemment passé en écoute s'il y en a plusieurs).
+# HA ne dit pas à WhoSpeaks quel satellite parle : on lui demande.
+SATELLITE_TEMPLATE = """\
+{%- set s = states.assist_satellite
+      | selectattr('state', 'in', ['listening', 'processing'])
+      | sort(attribute='last_changed', reverse=true) | list -%}
+{%- if s -%}
+{{ {'entity_id': s[0].entity_id, 'nom': s[0].name, 'piece': area_name(s[0].entity_id) or ''} | to_json }}
+{%- endif -%}"""
+SATELLITE_TIMEOUT = 1.0
+_WARN_EVERY = 60.0
 
 
 class HomeAssistant:
@@ -19,6 +33,7 @@ class HomeAssistant:
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self.last_error: str | None = None
+        self._satellite_warned_at = float("-inf")
 
     @property
     def enabled(self) -> bool:
@@ -61,6 +76,30 @@ class HomeAssistant:
             self.last_error = f"{type(err).__name__}: {err}"
             _LOGGER.warning("Home Assistant injoignable : %s", self.last_error)
             return False
+
+    async def active_satellite(self, timeout: float = SATELLITE_TIMEOUT) -> dict | None:
+        """Satellite en écoute : {entity_id, nom, piece}, ou None. Ne lève jamais d'exception."""
+        if not self.enabled:
+            return None
+        try:
+            resp = await asyncio.wait_for(
+                self._http().post("/api/template", json={"template": SATELLITE_TEMPLATE}), timeout
+            )
+            resp.raise_for_status()
+            text = resp.text.strip()
+            if not text:
+                return None
+            data = json.loads(text)
+            if not isinstance(data, dict) or not data.get("entity_id"):
+                return None
+            return {"entity_id": str(data["entity_id"]), "nom": str(data.get("nom") or ""),
+                    "piece": str(data.get("piece") or "")}
+        except Exception as err:  # noqa: BLE001
+            now = time.monotonic()
+            if now - self._satellite_warned_at >= _WARN_EVERY:
+                self._satellite_warned_at = now
+                _LOGGER.warning("Satellite actif inconnu (HA) : %s: %s", type(err).__name__, err)
+            return None
 
     async def fire(self, event_type: str, data: dict) -> None:
         if not self.enabled:
