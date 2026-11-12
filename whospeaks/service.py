@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import shutil
 import sqlite3
@@ -18,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 import numpy as np
 
-from . import calibration, clustering, rotation
+from . import calibration, clustering, rotation, vocab
 from .audio import SAMPLE_RATE, pcm16_to_float, read_wav, write_wav
 from .config import DEFAULT_SETTINGS, Config, validate_settings
 from .db import Database, from_blob, to_blob
@@ -64,6 +65,8 @@ class Analysis:
     reprise_age: float | None = None
     # Phrase reçue pendant un enrôlement (comptée ou non) : Jarvis ne doit pas y répondre.
     pendant_enrolement: bool = False
+    # Fin de la dernière parole selon le VAD, en secondes depuis le début de l'audio
+    fin_parole_s: float | None = None
     horodatage: float = field(default_factory=time.time)
     audio: np.ndarray | None = field(default=None, repr=False)
     emb: np.ndarray | None = field(default=None, repr=False)
@@ -111,6 +114,20 @@ class Enrolement:
     expire: float = 0.0
 
 
+# Temps de chaque étape d'une phrase, en secondes (colonnes de `phrases`) :
+# audio reçu, attente entre la fin de la parole et la fin du flux (détection de fin de
+# parole de HA), Whisper, identification et attente de l'identification après Whisper,
+# total du premier paquet audio au texte renvoyé à HA
+TIMING_FIELDS = ("duree_audio_s", "attente_fin_s", "whisper_s", "identification_s",
+                 "attente_identification_s", "total_s")
+# Temps résumés par médiane et 90e percentile sur 24 h
+TIMING_STATS = ("total_s", "whisper_s", "attente_fin_s", "identification_s")
+
+
+def _round(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 3)
+
+
 # Valeur du filtre « satellite » pour les phrases dont le satellite est inconnu
 SATELLITE_INCONNU = "?"
 
@@ -147,6 +164,15 @@ class WhoSpeaks:
         self.task: dict[str, Any] = {"nom": None, "etat": "inactif", "progression": 0.0, "message": ""}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.event_callback: EventCallback | None = None
+        # Vocabulaire de la maison (HA), gardé sur disque pour un démarrage sans HA
+        self._vocab_ha: dict | None = None
+        self.vocab_ha_maj: float | None = None
+        self.vocab_ha_erreur: str | None = None
+        self._vocab_terms: list[tuple[str, str]] = []
+        self._prompt = ""
+        self._prompt_terms: list[str] = []
+        self._load_vocab_cache()
+        self.rebuild_vocabulary()
 
     # ------------------------------------------------------------------ modèles
     @property
@@ -218,6 +244,8 @@ class WhoSpeaks:
                 if ign
                 else np.zeros((0, 0), dtype=np.float32)
             )
+        # Les prénoms enrôlés font partie du vocabulaire
+        self.rebuild_vocabulary()
 
     def update_settings(self, values: dict) -> dict:
         try:
@@ -231,6 +259,7 @@ class WhoSpeaks:
             self.change_model_async()
         else:
             self.reload()
+        self.rebuild_vocabulary()
         return self.settings
 
     # ------------------------------------------------------------ identification
@@ -239,9 +268,14 @@ class WhoSpeaks:
         audio = pcm16_to_float(pcm)
         if self.vad is None:
             return Analysis("erreur", audio=audio, erreur=self.model_error or "modèle non chargé")
-        s = self.settings
         t0 = time.perf_counter()
-        speech = self.vad.speech(audio)
+        speech, fin = self.vad.speech_and_end(audio)
+        result = self._classify(audio, speech, satellite, t0)
+        result.fin_parole_s = fin
+        return result
+
+    def _classify(self, audio: np.ndarray, speech: np.ndarray, satellite: str | None, t0: float) -> Analysis:
+        s = self.settings
         duree = len(speech) / SAMPLE_RATE
         if s["filtre_silence_actif"] and duree < s["silence_max_s"]:
             # Personne ne parle (faux réveil) : le proxy renverra un texte vide.
@@ -366,10 +400,12 @@ class WhoSpeaks:
         satellite: str | None = None,
         temps_ajoute_ms: float | None = None,
         satellite_entity: str | None = None,
+        temps: dict | None = None,
     ) -> int:
         """Enregistre la phrase dans le journal (après le renvoi du transcript).
 
         `satellite` : pièce (ou nom) affichée ; `satellite_entity` : entité HA ou identifiant.
+        `temps` : durées de chaque étape en secondes (clés de TIMING_FIELDS), mesurées par le proxy.
         """
         s = self.settings
         etat = "ignoree" if analysis.ignoree else "nouvelle"
@@ -387,7 +423,8 @@ class WhoSpeaks:
         cur = self.db.execute(
             "INSERT INTO phrases(horodatage, satellite, satellite_entity, transcript, resultat, "
             "personne_id, score, marge, cluster_id, duree_parole, empreinte, modele, etat, "
-            "temps_empreinte_ms, temps_ajoute_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "temps_empreinte_ms, temps_ajoute_ms, " + ", ".join(TIMING_FIELDS) + ") "
+            "VALUES(" + ",".join("?" * (15 + len(TIMING_FIELDS))) + ")",
             (
                 analysis.horodatage, satellite, satellite_entity, transcript, analysis.resultat,
                 analysis.person_id,
@@ -395,6 +432,7 @@ class WhoSpeaks:
                 None if analysis.emb is None else to_blob(analysis.emb),
                 model if analysis.emb is not None else None, etat,
                 analysis.temps_empreinte_ms, temps_ajoute_ms,
+                *(_round((temps or {}).get(k)) for k in TIMING_FIELDS),
             ),
         )
         phrase_id = int(cur.lastrowid)
@@ -715,7 +753,8 @@ class WhoSpeaks:
         rows = self.db.all(
             f"SELECT p.id, p.horodatage, p.satellite, p.satellite_entity, p.transcript, p.resultat, p.personne_id, "
             f"p.score, p.marge, p.cluster_id, p.duree_parole, p.clip, p.etat, p.empreinte IS NOT NULL "
-            f"AS a_empreinte, p.temps_empreinte_ms, p.temps_ajoute_ms, pe.nom, c.nom AS cluster_nom "
+            f"AS a_empreinte, p.temps_empreinte_ms, p.temps_ajoute_ms, p.transcript_corrige, "
+            f"{', '.join('p.' + k for k in TIMING_FIELDS)}, pe.nom, c.nom AS cluster_nom "
             f"FROM phrases p LEFT JOIN personnes pe ON pe.id=p.personne_id "
             f"LEFT JOIN clusters c ON c.id=p.cluster_id {where} "
             f"ORDER BY p.horodatage DESC LIMIT ? OFFSET ?",
@@ -1226,6 +1265,134 @@ class WhoSpeaks:
         self.enrolement = None
         self.reload()
         return {"extraits": clips, "personnes": len(self._person_meta)}
+
+    # ------------------------------------------------------------ vocabulaire
+    @property
+    def _vocab_cache_path(self) -> Path:
+        return self.config.data_dir / "vocabulaire_ha.json"
+
+    def _load_vocab_cache(self) -> None:
+        try:
+            cached = json.loads(self._vocab_cache_path.read_text(encoding="utf-8"))
+            self._vocab_ha, self.vocab_ha_maj = cached.get("data"), cached.get("maj")
+        except FileNotFoundError:
+            pass
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Vocabulaire HA en cache illisible : %s", err)
+
+    def set_ha_vocabulary(self, data: dict) -> None:
+        """Nouveau relevé de HA (entités partagées, pièces, étages)."""
+        self._vocab_ha, self.vocab_ha_maj, self.vocab_ha_erreur = data, time.time(), None
+        try:
+            self._vocab_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._vocab_cache_path.write_text(
+                json.dumps({"maj": self.vocab_ha_maj, "data": data}, ensure_ascii=False), encoding="utf-8")
+        except OSError as err:
+            _LOGGER.warning("Vocabulaire HA non mis en cache : %s", err)
+        self.rebuild_vocabulary()
+
+    def rebuild_vocabulary(self) -> None:
+        corrections = [r["vrai"] for r in self.db.all(
+            "SELECT vrai, SUM(nombre) AS n, MAX(derniere) AS d FROM corrections_mots "
+            "GROUP BY vrai ORDER BY n DESC, d DESC")]
+        persons = [r["nom"] for r in self.db.all("SELECT nom FROM personnes ORDER BY nom")]
+        terms = vocab.build_terms(self._vocab_ha, persons, self.settings.get("mots_en_plus") or [],
+                                  corrections)
+        prompt, kept = vocab.build_prompt(terms, int(self.settings.get("vocab_max_tokens") or 200))
+        with self._lock:
+            self._vocab_terms, self._prompt, self._prompt_terms = terms, prompt, kept
+
+    @property
+    def prompt(self) -> str:
+        """Prompt initial pour Whisper (STT_PROMPT de wyoming-whisper-gpu)."""
+        return self._prompt
+
+    @property
+    def prompt_terms(self) -> list[str]:
+        return list(self._prompt_terms)
+
+    def is_prompt_copy(self, text: str | None) -> bool:
+        return vocab.is_prompt_copy(text, self._prompt, self._prompt_terms)
+
+    def vocabulary_info(self) -> dict:
+        kept = set(self._prompt_terms)
+        ha = self._vocab_ha or {}
+        return {
+            "prompt": self._prompt,
+            "tokens": vocab.estimate_tokens(self._prompt),
+            "max_tokens": int(self.settings.get("vocab_max_tokens") or 200),
+            "termes": [{"terme": t, "categorie": c, "libelle": vocab.CATEGORY_LABELS[c], "dans_prompt": t in kept}
+                       for t, c in self._vocab_terms],
+            "ha": {"maj": self.vocab_ha_maj, "erreur": self.vocab_ha_erreur,
+                   "entites": len(ha.get("entities", [])), "pieces": len(ha.get("areas", [])),
+                   "etages": len(ha.get("floors", []))},
+            "corrections": self.list_corrections(),
+        }
+
+    def correct_text(self, phrase_id: int, texte: str) -> list[dict]:
+        """« Corriger le texte » : retient les mots que Whisper a mal compris.
+
+        Le texte transmis à HA reste celui de Whisper ; seule la phrase du journal garde
+        la correction, et les mots corrigés passent en tête du vocabulaire.
+        """
+        row = self._phrase(phrase_id)
+        texte = " ".join((texte or "").split())
+        if not texte:
+            raise ServiceError("Texte corrigé vide")
+        if not row["transcript"]:
+            raise ServiceError("Pas de texte de Whisper à comparer")
+        if texte == row["transcript_corrige"]:
+            pairs = []  # même correction renvoyée : rien de nouveau à compter
+        else:
+            pairs = vocab.corrected_words(row["transcript"], texte)
+            now = time.time()
+            with self.db.tx() as conn:
+                conn.execute("UPDATE phrases SET transcript_corrige=? WHERE id=?", (texte, phrase_id))
+                conn.executemany(
+                    "INSERT INTO corrections_mots(faux, vrai, nombre, derniere) VALUES(?, ?, 1, ?) "
+                    "ON CONFLICT(faux, vrai) DO UPDATE SET nombre=nombre+1, derniere=excluded.derniere",
+                    [(faux, vrai, now) for faux, vrai in pairs],
+                )
+            self.rebuild_vocabulary()
+            if pairs:
+                _LOGGER.info("Mots mal compris : %s", ", ".join(f"{f} → {v}" for f, v in pairs))
+        return [{"faux": f, "vrai": v} for f, v in pairs]
+
+    def list_corrections(self) -> list[dict]:
+        return [dict(r) for r in self.db.all(
+            "SELECT faux, vrai, nombre, derniere FROM corrections_mots ORDER BY nombre DESC, derniere DESC")]
+
+    def delete_correction(self, faux: str, vrai: str) -> None:
+        self.db.execute("DELETE FROM corrections_mots WHERE faux=? AND vrai=?", (faux, vrai))
+        self.rebuild_vocabulary()
+
+    # ------------------------------------------------------------------ temps
+    def timing_stats(self, hours: float = 24) -> list[dict]:
+        """Médiane et 90e percentile de chaque temps sur `hours` heures, par satellite
+        (None : satellite inconnu), plus une ligne « tous »."""
+        since = time.time() - hours * 3600
+        rows = self.db.all(
+            f"SELECT satellite, {', '.join(TIMING_STATS)} FROM phrases WHERE horodatage >= ?", (since,))
+        groups: dict[str | None, list] = {}
+        for r in rows:
+            groups.setdefault(r["satellite"], []).append(r)
+
+        def summary(items: list) -> dict:
+            out: dict = {"phrases": len(items)}
+            for key in TIMING_STATS:
+                values = np.array([r[key] for r in items if r[key] is not None], dtype=float)
+                out[key] = None if not len(values) else {
+                    "mediane": round(float(np.median(values)), 3),
+                    "p90": round(float(np.percentile(values, 90)), 3),
+                    "n": int(len(values)),
+                }
+            return out
+
+        order = sorted(groups, key=lambda sat: (sat is None, (sat or "").casefold()))
+        stats = [{"satellite": sat, **summary(groups[sat])} for sat in order]
+        if len(groups) > 1:
+            stats.append({"satellite": "tous", **summary(rows)})
+        return stats
 
     # ------------------------------------------------------------------ état
     def status(self) -> dict:

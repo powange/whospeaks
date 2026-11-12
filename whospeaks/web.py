@@ -21,6 +21,7 @@ from . import __version__
 from .audio import decode_file
 from .config import DEFAULT_SETTINGS, Config, IPNetwork
 from .models import SPEAKER_MODELS
+from .ha_ws import refresh_vocabulary
 from .service import ServiceError, WhoSpeaks
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -50,6 +51,10 @@ class MergeIn(BaseModel):
 
 class RenameIn(BaseModel):
     nom: str | None = None
+
+
+class TexteIn(BaseModel):
+    texte: str
 
 
 class EnrolIn(BaseModel):
@@ -128,6 +133,37 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
                       satellite: str | None = None):
         # satellite : pièce ou nom affiché, « ? » pour les phrases au satellite inconnu
         return await run(service.list_phrases, min(limit, 500), offset, filtre, satellite)
+
+    @app.post("/api/phrases/{phrase_id}/texte", dependencies=[api])
+    async def phrase_texte(phrase_id: int, body: TexteIn):
+        """« Corriger le texte » : ce qui a vraiment été dit. Le texte envoyé à HA ne change pas."""
+        return {"mots": await run(service.correct_text, phrase_id, body.texte)}
+
+    @app.get("/api/temps", dependencies=[api])
+    async def temps(heures: float = 24):
+        """Médiane et 90e percentile des temps de chaque étape, par satellite."""
+        return await run(service.timing_stats, heures)
+
+    @app.get("/api/vocabulaire", dependencies=[api])
+    async def vocabulaire():
+        return service.vocabulary_info()
+
+    @app.get("/api/vocabulaire/prompt", dependencies=[api])
+    async def vocabulaire_prompt():
+        """Prompt en texte brut, à copier dans STT_PROMPT de wyoming-whisper-gpu."""
+        return Response(service.prompt, media_type="text/plain; charset=utf-8")
+
+    @app.post("/api/vocabulaire/rafraichir", dependencies=[api])
+    async def vocabulaire_rafraichir():
+        ok = await refresh_vocabulary(service, config.ha_url, config.ha_token)
+        if not ok:
+            raise HTTPException(502, f"Home Assistant : {service.vocab_ha_erreur}")
+        return service.vocabulary_info()
+
+    @app.delete("/api/vocabulaire/corrections", dependencies=[api])
+    async def vocabulaire_correction_supprimer(faux: str, vrai: str):
+        await run(service.delete_correction, faux, vrai)
+        return {"ok": True}
 
     @app.get("/api/satellites", dependencies=[api])
     async def satellites():

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+### Ajouts
+
+- **Vocabulaire de la maison pour Whisper** (onglet Vocabulaire).
+  - Construit depuis HA par l'API WebSocket, au démarrage puis toutes les 15 min : noms et alias des entités partagées avec Assist, pièces et étages. S'y ajoutent les prénoms enrôlés, les « Mots en plus » saisis à la main et les mots mal compris.
+  - Le prompt est une liste de termes, tronquée par priorité sous `vocab_max_tokens` (200).
+  - Le dernier relevé de HA est gardé dans `data/vocabulaire_ha.json`.
+  - Transmission : `wyoming_openai` n'accepte pas de prompt par phrase. Le prompt se copie dans sa variable `STT_PROMPT` (marche à suivre dans le README ; `GET /api/vocabulaire/prompt`). Les termes sont aussi envoyés dans le champ Wyoming `transcript_terms`, ignoré par le pont pour l'instant.
+  - Un texte qui recopie le prompt est classé `ignoree_hallucination`.
+- **Temps de chaque étape** pour chaque phrase : audio reçu, parole, attente de la fin de parole côté HA, Whisper, identification et attente de l'identification, total.
+  - Affichés dans le journal : colonne Temps, détail ⓘ, et médiane et 90e percentile sur 24 h par satellite (`GET /api/temps`).
+  - Publiés dans HA : `sensor.whospeaks_temps_whisper` et `sensor.whospeaks_temps_total`.
+- **Corriger le texte** d'une phrase (détail ⓘ du journal). Les mots remplacés (« impliment » → « imprimante ») passent en tête du vocabulaire, et sont listés dans « Mots souvent mal compris ». Le texte envoyé à HA reste celui de Whisper.
+- Réglages `mots_en_plus` et `vocab_max_tokens` (20 à 224).
+- Nouvelle dépendance : `websockets`.
+
 ## 0.5.1
 
 ### Ajouts

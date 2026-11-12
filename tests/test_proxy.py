@@ -34,6 +34,8 @@ class FakeWhisper:
         self.texts = list(TEXTS)
         self.received_bytes = 0
         self.server = None
+        self.delay = WHISPER_DELAY  # temps de « transcription »
+        self.transcribes = []  # données des événements transcribe reçus
 
     async def handle(self, reader, writer):
         try:
@@ -48,10 +50,12 @@ class FakeWhisper:
                         models=[AsrModel(name="large-v3", attribution=Attribution("test", ""), installed=True,
                                          description=None, version=None, languages=["fr", "en"])])])
                     await async_write_event(info.event(), writer)
+                elif Transcribe.is_type(event.type):
+                    self.transcribes.append(dict(event.data))
                 elif AudioChunk.is_type(event.type):
                     self.received_bytes += len(event.payload or b"")
                 elif AudioStop.is_type(event.type):
-                    await asyncio.sleep(WHISPER_DELAY)
+                    await asyncio.sleep(self.delay)
                     text = self.texts.pop(0) if self.texts else "fin"
                     await async_write_event(Transcript(text=text, language="fr").event(), writer)
         finally:
@@ -64,10 +68,12 @@ class FakeWhisper:
 
 class FakeHA:
     """Faux HA : `calls` reçoit capteur et événements ; `/api/template` (satellite actif)
-    répond avec `satellite` (dict ou None), compté à part dans `template_calls`."""
+    répond avec `satellite` (dict ou None), compté à part dans `template_calls` ; les capteurs
+    de temps (sensor.whospeaks_temps_*) vont dans `timing_calls`."""
 
     def __init__(self, satellite=None):
         self.calls = []
+        self.timing_calls = []
         self.template_calls = 0
         self.satellite = satellite
 
@@ -76,6 +82,9 @@ class FakeHA:
             if request.url.path == "/api/template":
                 self.template_calls += 1
                 return httpx.Response(200, text=json.dumps(self.satellite) if self.satellite else "")
+            if request.url.path.startswith("/api/states/sensor.whospeaks_temps_"):
+                self.timing_calls.append((request.url.path, json.loads(request.read())))
+                return httpx.Response(200, json={})
             self.calls.append((time.perf_counter(), request.url.path, request.read()))
             return httpx.Response(200, json={})
         return httpx.MockTransport(handler)

@@ -101,6 +101,30 @@ class HomeAssistant:
                 _LOGGER.warning("Satellite actif inconnu (HA) : %s: %s", type(err).__name__, err)
             return None
 
+    async def publish_timings(self, temps: dict, satellite: str | None, resultat: str | None) -> None:
+        """sensor.whospeaks_temps_whisper et sensor.whospeaks_temps_total (secondes).
+
+        Publié après la réponse à HA, sans la retarder ; ne lève jamais d'exception.
+        """
+        attributes = {
+            "unit_of_measurement": "s", "device_class": "duration", "state_class": "measurement",
+            "satellite": satellite, "resultat": resultat,
+            **{k: None if v is None else round(v, 3) for k, v in temps.items()},
+        }
+        posts = []
+        for key, entity, label in (("whisper_s", "sensor.whospeaks_temps_whisper", "Temps Whisper"),
+                                   ("total_s", "sensor.whospeaks_temps_total", "Temps total de la phrase")):
+            if temps.get(key) is not None:
+                body = {"state": round(temps[key], 2),
+                        "attributes": {**attributes, "friendly_name": label, "icon": "mdi:timer-outline"}}
+                posts.append(self._post(f"/api/states/{entity}", body, timeout=2.0))
+        if not posts:
+            return
+        try:
+            await asyncio.gather(*posts)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Capteurs de temps non publiés : %s", err)
+
     async def fire(self, event_type: str, data: dict) -> None:
         if not self.enabled:
             return

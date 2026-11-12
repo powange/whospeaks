@@ -140,6 +140,10 @@ DEFAULT_SETTINGS: dict = {
         "sous-titres réalisés par la communauté d'amara.org",
         "...",
     ],
+    # Vocabulaire donné à Whisper : mots ajoutés à la main, et taille maximale du prompt
+    # (Whisper accepte 224 tokens ; au-delà de ~200, il se dégrade ou recopie le prompt)
+    "mots_en_plus": [],
+    "vocab_max_tokens": 200,
     "modele": None,  # None : on utilise la variable MODEL
     "personnes_ha": {},  # nom -> person.xxx (complète le champ de chaque personne)
 }
@@ -148,6 +152,7 @@ DEFAULT_SETTINGS: dict = {
 _BOUNDS: dict[str, tuple[float, float]] = {
     "reprise_duree_s": (0, 600),
     "silence_max_s": (0, 2),
+    "vocab_max_tokens": (20, 224),
 }
 
 

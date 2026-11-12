@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -139,6 +140,11 @@ class ProxyHandler(AsyncEventHandler):
         # Un transcript a déjà été renvoyé pour cette phrase : la suite de l'amont est ignorée.
         self.replied = False
         self.t_stop = 0.0
+        # Temps de la phrase en cours (secondes, clés de service.TIMING_FIELDS) et premier paquet
+        self.temps: dict = {}
+        self.t_first_chunk: float | None = None
+        # Résolu quand le texte (ou le texte vide) est parti vers HA : le journal attend le total
+        self.sent: asyncio.Future | None = None
 
     # -------------------------------------------------------------- client -> amont
     async def handle_event(self, event: Event) -> bool:
@@ -153,21 +159,27 @@ class ProxyHandler(AsyncEventHandler):
             if from_context:
                 # Le contexte de HA reste prioritaire s'il est fourni
                 self._set_satellite(str(from_context), str(from_context), "context")
+            event = self._with_terms(event)
 
         if AudioStart.is_type(event.type):
             self.audio.clear()
             self.analysis_future = None
             self.replied = False
+            self.temps = {}
+            self.t_first_chunk = None
+            self.sent = None
             self._ask_satellite()
 
         if self.upstream is None and not await self._connect_upstream():
             await self.write_event(Error(text="Serveur STT amont injoignable", code="upstream").event())
             return False
 
-        # L'événement est relayé tel quel, sans réencodage.
+        # L'événement est relayé tel quel, sans réencodage (transcribe : termes ajoutés).
         await self.upstream.write_event(event)
 
         if AudioChunk.is_type(event.type):
+            if self.t_first_chunk is None:
+                self.t_first_chunk = time.perf_counter()
             try:
                 chunk = self.converter.convert(AudioChunk.from_event(event))
                 self.audio.extend(chunk.audio)
@@ -175,8 +187,22 @@ class ProxyHandler(AsyncEventHandler):
                 _LOGGER.exception("Conversion audio impossible")
         elif AudioStop.is_type(event.type):
             self.t_stop = time.perf_counter()
+            self.temps["duree_audio_s"] = len(self.audio) / (16000 * 2)
+            self.sent = asyncio.get_running_loop().create_future()
             self._start_analysis()
         return True
+
+    def _with_terms(self, event: Event) -> Event:
+        """Ajoute le vocabulaire de la maison au champ Wyoming `transcript_terms`.
+
+        Champ prévu pour ça par le protocole, mais wyoming_openai l'ignore encore : le prompt
+        passe aujourd'hui par son option STT_PROMPT (voir README). Sans effet de bord sinon.
+        """
+        service = self.proxy.service
+        terms = service.prompt_terms if service is not None else []
+        if not terms or event.data.get("transcript_terms"):
+            return event
+        return Event(type=event.type, data={**event.data, "transcript_terms": terms}, payload=event.payload)
 
     async def _connect_upstream(self) -> bool:
         try:
@@ -226,19 +252,25 @@ class ProxyHandler(AsyncEventHandler):
         service = self.proxy.service
         if service is None or not self.audio:
             return
-        self.analysis_future = asyncio.ensure_future(self._analyze(service, bytes(self.audio)))
+        self.analysis_future = asyncio.ensure_future(self._analyze(service, bytes(self.audio), self.temps))
         if service.settings["filtre_silence_actif"]:
             self.silence_task = asyncio.create_task(self._reply_if_silence(self.analysis_future),
                                                     name="whospeaks silence")
 
-    async def _analyze(self, service: WhoSpeaks, pcm: bytes) -> Analysis:
+    async def _analyze(self, service: WhoSpeaks, pcm: bytes, temps: dict) -> Analysis:
         # Clé de la reprise : le satellite s'il est déjà connu. En pratique HA a répondu
         # (demandé au début de la phrase) ; sinon, pas d'attente : HA lent ou coupé ne doit
         # pas retarder l'identification, et la reprise passe par l'entrée globale.
         await self._resolve_satellite(0)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
-                                          self.satellite_entity)
+        t0 = time.perf_counter()
+        analysis = await loop.run_in_executor(self.proxy.analyze_pool, service.analyze, pcm,
+                                              self.satellite_entity)
+        temps["identification_s"] = time.perf_counter() - t0
+        if analysis.fin_parole_s is not None and temps.get("duree_audio_s") is not None:
+            # La parole est finie, HA continue d'envoyer l'audio jusqu'à sa propre détection
+            temps["attente_fin_s"] = max(0.0, temps["duree_audio_s"] - analysis.fin_parole_s)
+        return analysis
 
     async def _reply_if_silence(self, future: asyncio.Future) -> None:
         """Pas de parole : texte vide tout de suite, sans attendre Whisper.
@@ -264,6 +296,14 @@ class ProxyHandler(AsyncEventHandler):
         event = Transcript(text="").event()
         event.data["ignored"] = reason
         await self.write_event(event)
+        self._mark_sent()
+
+    def _mark_sent(self) -> None:
+        """Texte parti vers HA : temps total depuis le premier paquet audio."""
+        if self.t_first_chunk is not None:
+            self.temps["total_s"] = time.perf_counter() - self.t_first_chunk
+        if self.sent is not None and not self.sent.done():
+            self.sent.set_result(None)
 
     # -------------------------------------------------------------- amont -> client
     async def _read_upstream(self, client: AsyncClient) -> None:
@@ -295,6 +335,8 @@ class ProxyHandler(AsyncEventHandler):
     async def _send_transcript(self, event: Event) -> None:
         t_up = time.perf_counter()
         text = event.data.get("text")
+        if self.t_stop:
+            self.temps["whisper_s"] = t_up - self.t_stop
         analysis: Analysis | None = None
         future = self.analysis_future
         self.analysis_future = None
@@ -306,6 +348,8 @@ class ProxyHandler(AsyncEventHandler):
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Identification en échec")
             future = None
+        # Attente de l'identification après l'arrivée du texte (au plus ID_EXTRA_WAIT)
+        self.temps["attente_identification_s"] = time.perf_counter() - t_up
 
         if self.replied:
             return  # le silence a répondu pendant l'attente
@@ -338,6 +382,7 @@ class ProxyHandler(AsyncEventHandler):
                                                 "speaker_score": analysis.score}, payload=event.payload)
         self.replied = True
         await self.write_event(out)
+        self._mark_sent()
         t_sent = time.perf_counter()
         added_ms = (t_sent - t_up) * 1000
         _LOGGER.info(
@@ -370,19 +415,29 @@ class ProxyHandler(AsyncEventHandler):
             return None
         if is_hallucination(text, service.settings["hallucinations"]):
             return "hallucination"
+        if service.is_prompt_copy(text):
+            # Whisper a recopié le prompt du vocabulaire au lieu de transcrire
+            return "hallucination"
         return None
 
     def _schedule_record(self, service: WhoSpeaks, future: asyncio.Future, text: str | None,
                          added_ms: float | None, filtered: str | None = None) -> None:
-        self.proxy.keep(asyncio.create_task(self._record(service, future, text, added_ms, filtered),
-                                            name="whospeaks record"))
+        # Temps et fin d'envoi de CETTE phrase (la connexion peut en commencer une autre)
+        self.proxy.keep(asyncio.create_task(
+            self._record(service, future, text, added_ms, filtered, self.temps, self.sent),
+            name="whospeaks record"))
 
     async def _record(self, service: WhoSpeaks, future: asyncio.Future, text: str | None,
-                      added_ms: float | None, filtered: str | None) -> None:
+                      added_ms: float | None, filtered: str | None, temps: dict,
+                      sent: asyncio.Future | None) -> None:
         try:
             analysis: Analysis = await asyncio.shield(future)
         except Exception:  # noqa: BLE001
             return
+        if sent is not None:
+            # Enregistrement programmé avant l'envoi : on attend le temps total
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(sent), 2.0)
         if filtered in ("silence", "hallucination"):
             analysis.resultat = f"ignoree_{filtered}"
         # « enrolement » : la phrase garde son résultat et compte pour l'enrôlement.
@@ -391,9 +446,14 @@ class ProxyHandler(AsyncEventHandler):
             analysis.resultat = "trop_court"
         # Le transcript est déjà parti : on peut attendre HA plus longtemps pour le journal.
         await self._resolve_satellite(SATELLITE_TIMEOUT)
+        ha = self.proxy.ha
+        if ha is not None and ha.enabled:
+            self.proxy.keep(asyncio.create_task(
+                ha.publish_timings(dict(temps), self.satellite, analysis.resultat),
+                name="whospeaks temps"))
         await asyncio.get_running_loop().run_in_executor(
             self.proxy.record_pool, _safe_record, service, analysis, text, self.satellite, added_ms,
-            self.satellite_entity,
+            self.satellite_entity, dict(temps),
         )
 
     async def disconnect(self) -> None:
@@ -410,8 +470,9 @@ class ProxyHandler(AsyncEventHandler):
 
 
 def _safe_record(service: WhoSpeaks, analysis: Analysis, text: str | None, satellite: str | None,
-                 added_ms: float | None, satellite_entity: str | None = None) -> None:
+                 added_ms: float | None, satellite_entity: str | None = None,
+                 temps: dict | None = None) -> None:
     try:
-        service.record(analysis, text, satellite, added_ms, satellite_entity)
+        service.record(analysis, text, satellite, added_ms, satellite_entity, temps)
     except Exception:  # noqa: BLE001
         _LOGGER.exception("Enregistrement de la phrase impossible")

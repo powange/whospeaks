@@ -150,9 +150,10 @@ function resultBadge(p) {
 // --- Journal ---
 async function renderJournal() {
   const root = document.getElementById("journal");
-  const [phrases, satellites] = await Promise.all([
+  const [phrases, satellites, temps] = await Promise.all([
     api("GET", "/api/phrases?" + new URLSearchParams({ limit: 150, ...journalParams() })),
     api("GET", "/api/satellites"),
+    api("GET", "/api/temps"),
   ]);
   const filtre = h("select", { onchange: (e) => { state.filtre = e.target.value; refresh(); } },
     JOURNAL_FILTERS.map(([v, l]) => h("option", { value: v, selected: state.filtre === v }, l)));
@@ -167,19 +168,113 @@ async function renderJournal() {
     h("div", {}, h("div", {}, fmtDate(p.horodatage)),
       h("div", { class: "muted" }, [p.duree_parole ? `${p.duree_parole.toFixed(1)} s` : null,
         p.temps_ajoute_ms !== null ? `+${Math.round(p.temps_ajoute_ms)} ms` : null].filter(Boolean).join(" · "))),
-    h("div", { class: "grow" }, h("div", { class: "row" }, satelliteBadge(p), resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—")),
+    h("div", { class: "grow" }, h("div", { class: "row" }, satelliteBadge(p), resultBadge(p)), h("div", { class: "transcript" }, p.transcript || "—"),
+      p.transcript_corrige ? h("div", { class: "muted" }, "vraiment dit : ", h("span", { class: "transcript" }, p.transcript_corrige)) : null),
+    timingCell(p),
     h("div", { class: "actions" },
+      h("button", { class: openDetails.has(p.id) ? "on" : null, title: "Détail : temps de chaque étape, correction du texte", onclick: () => { openDetails.has(p.id) ? openDetails.delete(p.id) : openDetails.add(p.id); refresh(); } }, "ⓘ"),
       p.audio ? playButton(`/api/phrases/${p.id}/audio`) : null,
       p.resultat === "reprise" || ((p.a_empreinte || p.audio) && !["trop_court", "ignoree_silence"].includes(p.resultat))
         ? personSelect((b) => act(() => api("POST", `/api/phrases/${p.id}/attribuer`, b), "Phrase attribuée"),
           p.personne_id ? "Corriger…" : "Attribuer à…") : null,
       p.personne_id ? h("button", { title: "Ce n'était pas cette personne", onclick: () => act(() => api("POST", `/api/phrases/${p.id}/desattribuer`), "Remise en inconnue") }, "✗ pas lui/elle") : null,
       !p.personne_id && p.etat !== "ignoree" && p.a_empreinte ? h("button", { onclick: () => act(() => api("POST", `/api/phrases/${p.id}/ignorer`), "Ignorée") }, "Ignorer") : null,
-      h("button", { class: "danger", title: "Supprimer", onclick: () => confirm("Supprimer cette phrase du journal ?") && act(() => api("DELETE", `/api/phrases/${p.id}`)) }, "🗑")))
+      h("button", { class: "danger", title: "Supprimer", onclick: () => confirm("Supprimer cette phrase du journal ?") && act(() => api("DELETE", `/api/phrases/${p.id}`)) }, "🗑")),
+    openDetails.has(p.id) ? phraseDetails(p) : null)
   ) : [h("div", { class: "empty" }, "Aucune phrase pour l'instant.")];
   root.replaceChildren(h("div", { class: "toolbar" }, filtre, satFilter, bulk,
     h("label", { class: "muted" }, h("input", { type: "checkbox", id: "auto", checked: autoRefresh, onchange: (e) => (autoRefresh = e.target.checked) }), " actualisation auto")),
-    satelliteStats(satellites), ...list);
+    satelliteStats(satellites), timingStats(temps), ...list);
+}
+
+// --- Temps de chaque étape ---
+const openDetails = new Set();
+const TIMINGS = [
+  ["duree_audio_s", "Audio reçu de HA"],
+  ["duree_parole", "Parole (VAD)"],
+  ["attente_fin_s", "Attente fin de parole → fin du flux (détection de HA)"],
+  ["whisper_s", "Whisper (fin du flux → texte)"],
+  ["identification_s", "Identification de la voix"],
+  ["attente_identification_s", "Attente de l'identification après Whisper"],
+  ["total_s", "Total (premier paquet audio → texte renvoyé à HA)"],
+];
+const sec = (v) => (v === null || v === undefined) ? "—" : `${v.toFixed(v < 10 ? 2 : 1)} s`;
+
+function timingCell(p) {
+  if (p.total_s === null || p.total_s === undefined) return h("div", { class: "temps muted" }, "");
+  return h("div", { class: "temps", title: "Temps total, dont Whisper" },
+    h("div", {}, `⏱ ${sec(p.total_s)}`),
+    p.whisper_s !== null ? h("div", { class: "muted" }, `Whisper ${sec(p.whisper_s)}`) : null);
+}
+
+function phraseDetails(p) {
+  const corriger = () => {
+    const texte = prompt("Ce qui a vraiment été dit :", p.transcript_corrige || p.transcript || "");
+    if (texte === null || !texte.trim()) return;
+    act(async () => {
+      const r = await api("POST", `/api/phrases/${p.id}/texte`, { texte });
+      toast(r.mots.length ? `Mots retenus : ${r.mots.map((m) => `${m.faux} → ${m.vrai}`).join(", ")}` : "Texte enregistré (aucun mot différent)");
+    });
+  };
+  return h("div", { class: "details" },
+    h("table", {}, TIMINGS.map(([k, l]) => h("tr", {}, h("td", { class: "muted" }, l), h("td", {}, sec(p[k]))))),
+    h("div", { class: "row" },
+      p.transcript ? h("button", { onclick: corriger }, "✎ Corriger le texte") : null,
+      h("span", { class: "muted" }, "Le texte envoyé à HA reste celui de Whisper ; les mots corrigés passent en tête du vocabulaire.")));
+}
+
+// Médiane et 90e percentile sur 24 h, par satellite
+function timingStats(stats) {
+  const rows = stats.filter((x) => x.total_s || x.whisper_s);
+  if (!rows.length) return null;
+  const pair = (v) => v ? `${v.mediane.toFixed(1)} / ${v.p90.toFixed(1)} s` : "—";
+  return h("div", { class: "stats muted" }, "Temps sur 24 h (médiane / 90 %) : ",
+    rows.map((x) => h("span", { class: "badge none", title: `${x.phrases} phrase(s)` },
+      `${x.satellite ?? "?"} : total ${pair(x.total_s)} · Whisper ${pair(x.whisper_s)} · fin de parole ${pair(x.attente_fin_s)}`)));
+}
+
+// --- Vocabulaire ---
+async function renderVocabulaire() {
+  const root = document.getElementById("vocabulaire");
+  const v = await api("GET", "/api/vocabulaire");
+  const manual = h("textarea", { rows: 3, spellcheck: "false", placeholder: "Jarvis, OctoPi, Ambilight, frotte-frotte" });
+  manual.value = (state.reglages.mots_en_plus || []).join(", ");
+  const maxTokens = h("input", { type: "number", min: 20, max: 224, step: 10, value: v.max_tokens });
+  const save = () => act(() => api("PUT", "/api/reglages", {
+    mots_en_plus: manual.value.split(/[,\n]/).map((m) => m.trim()).filter(Boolean),
+    vocab_max_tokens: Number(maxTokens.value),
+  }), "Vocabulaire enregistré");
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(v.prompt); toast("Prompt copié"); } catch (e) { toast("Copie impossible : sélectionner le texte à la main", true); }
+  };
+  const ha = v.ha.maj ? `relevé dans HA le ${fmtDate(v.ha.maj)} : ${v.ha.entites} entité(s) partagée(s) avec Assist, ${v.ha.pieces} pièce(s), ${v.ha.etages} étage(s)` : "jamais relevé dans HA";
+  const byCat = {};
+  for (const t of v.termes) (byCat[t.libelle] ??= []).push(t);
+  root.replaceChildren(
+    h("div", { class: "card" }, h("h2", {}, "Prompt donné à Whisper"),
+      h("pre", { class: "prompt" }, v.prompt || "(vide)"),
+      h("div", { class: "row" },
+        h("span", { class: "badge " + (v.tokens > v.max_tokens ? "bad" : "none") }, `≈ ${v.tokens} / ${v.max_tokens} tokens`),
+        h("button", { onclick: copy }, "Copier"),
+        h("a", { href: url("/api/vocabulaire/prompt"), target: "_blank" }, "texte brut"),
+        h("button", { onclick: () => act(() => api("POST", "/api/vocabulaire/rafraichir"), "Vocabulaire relevé dans HA") }, "Relire HA maintenant")),
+      h("p", { class: "muted" }, `Vocabulaire ${ha}. ` + (v.ha.erreur ? `Dernier relevé en échec : ${v.ha.erreur}. ` : "") +
+        "Relu au démarrage puis toutes les 15 min. wyoming-whisper-gpu ne lit pas encore de prompt par phrase : " +
+        "copier ce texte dans sa variable STT_PROMPT et le redémarrer (voir le README).")),
+    h("div", { class: "card" }, h("h2", {}, "Mots en plus"),
+      h("div", { class: "form-grid" },
+        h("label", { class: "wide" }, "Mots à faire connaître à Whisper (séparés par des virgules)", manual),
+        h("label", {}, "Taille maximale du prompt (tokens)", maxTokens)),
+      h("div", { class: "toolbar", style: "margin-top:12px" }, h("button", { class: "primary", onclick: save }, "Enregistrer"))),
+    h("div", { class: "card" }, h("h2", {}, "Mots souvent mal compris"),
+      v.corrections.length ? h("table", {},
+        h("tr", {}, h("th", {}, "Whisper a écrit"), h("th", {}, "Vraiment dit"), h("th", {}, "Fois"), h("th", {}, "")),
+        v.corrections.map((c) => h("tr", {}, h("td", {}, c.faux), h("td", {}, h("strong", {}, c.vrai)), h("td", {}, c.nombre),
+          h("td", {}, h("button", { class: "danger", onclick: () => act(() => api("DELETE", "/api/vocabulaire/corrections?" + new URLSearchParams({ faux: c.faux, vrai: c.vrai })), "Mot retiré") }, "🗑")))))
+        : h("p", { class: "muted" }, "Aucun pour l'instant. Dans le Journal, ⓘ puis « Corriger le texte » sur une phrase mal transcrite.")),
+    h("details", { class: "card" }, h("summary", {}, `Tous les termes (${v.termes.length}), par priorité`),
+      Object.entries(byCat).map(([cat, terms]) => h("div", { class: "termes" }, h("strong", {}, cat + " : "),
+        terms.map((t) => h("span", { class: "badge " + (t.dans_prompt ? "none" : "warn"), title: t.dans_prompt ? "dans le prompt" : "hors prompt (trop long)" }, t.terme))))));
 }
 
 function journalParams() {
@@ -542,6 +637,7 @@ async function refresh() {
     if (state.tab === "journal") await renderJournal();
     else if (state.tab === "personnes") await renderPersonnes();
     else if (state.tab === "inconnus") await renderInconnus();
+    else if (state.tab === "vocabulaire") await renderVocabulaire();
     else if (state.tab === "reglages") await renderReglages();
   } catch (e) {
     toast(e.message, true);

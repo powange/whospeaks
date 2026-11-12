@@ -197,6 +197,70 @@ Home Assistant n'indique pas à WhoSpeaks quel satellite a capté la phrase : l'
 - La requête part en tâche de fond pendant que l'audio arrive. Elle ne retarde ni le relais vers Whisper ni la réponse : HA lent ou coupé donne simplement « ? ». Délai maximum : 1 s pour le journal. Le capteur prend le satellite s'il est déjà connu au moment de répondre, ce qui est le cas en pratique.
 - En cas d'échec, un avertissement est journalisé au plus une fois par minute. Le journal indique aussi l'origine à chaque changement : `satellite source: context|ha|inconnu`.
 
+### Vocabulaire de la maison pour Whisper
+
+Whisper écorche les noms propres de la maison (« Allume l'**impliment** 3D » au lieu de « l'imprimante 3D »), et HA ne trouve alors pas l'appareil. WhoSpeaks construit un **prompt initial** avec ces noms, pour que Whisper les reconnaisse. Onglet **Vocabulaire**.
+
+**Termes retenus, par priorité.** Si le prompt dépasse la limite, ce sont les derniers qui sautent :
+1. les mots déjà **mal compris**, relevés par « Corriger le texte » (voir plus bas) ;
+2. les **mots en plus**, ajoutés à la main dans l'onglet Vocabulaire (`Jarvis, OctoPi, Ambilight, frotte-frotte`) ;
+3. les **prénoms** enrôlés dans WhoSpeaks ;
+4. les **alias** des entités partagées avec Assist, des pièces et des étages ;
+5. les **noms** des entités partagées avec Assist ;
+6. les noms des **pièces** et des **étages**.
+
+**Source HA.** Le vocabulaire est relu par l'API WebSocket de HA (même jeton `HA_TOKEN`), au démarrage puis toutes les 15 minutes : `homeassistant/expose_entity/list` (seules les entités partagées avec Assist comptent), registres des entités, des pièces et des étages. Le dernier relevé est gardé dans `data/vocabulaire_ha.json` : le prompt reste disponible si HA est injoignable au démarrage. Le bouton « Relire HA maintenant » force un relevé.
+
+**Format du prompt.** C'est une liste de termes séparés par des virgules, limitée à `vocab_max_tokens` (200 par défaut, estimés à 3 caractères par token). Au-delà, Whisper se dégrade ou recopie le prompt. La liste ne contient aucun verbe : ainsi, une vraie commande (« allume l'imprimante 3D ») ne ressemble pas à une recopie du prompt.
+
+**Transmission à Whisper : à faire à la main aujourd'hui.** Le pont `wyoming-whisper-gpu` (`wyoming_openai`) ne lit pas de prompt par phrase :
+- il ignore le contexte de `transcribe` ;
+- il reçoit bien le champ Wyoming `transcript_terms`, prévu pour ça, mais ne l'utilise pas encore.
+
+Il accepte en revanche un prompt fixe, lu au démarrage : la variable `STT_PROMPT` (option `--stt-prompt`), envoyée à `whisper-server` avec chaque transcription. Marche à suivre :
+1. Copier le prompt depuis l'onglet Vocabulaire (bouton « Copier »), ou le récupérer en texte brut :
+   ```bash
+   curl -H "Authorization: Bearer $UI_TOKEN" http://192.168.0.13:8095/api/vocabulaire/prompt
+   ```
+2. L'ajouter au service `wyoming-whisper-gpu` dans son `docker-compose.yml`, sur le GEEKOM :
+   ```yaml
+   services:
+     wyoming-whisper-gpu:
+       environment:
+         STT_PROMPT: "imprimante, Jarvis, OctoPi, Ambilight, Imprimante 3D, Sécheur de bobine, Salon, …"
+   ```
+3. Redémarrer le pont : `docker compose up -d wyoming-whisper-gpu`.
+4. Recommencer quand le vocabulaire change beaucoup (nouveaux appareils, mots mal compris).
+
+WhoSpeaks envoie aussi les termes dans `transcript_terms` à chaque phrase : le jour où le pont les prendra en charge, il n'y aura plus rien à faire. `whisper-server` doit honorer le champ `prompt` de l'API OpenAI. Le vérifier une fois en dictant une phrase avec un mot du prompt.
+
+**Recopie du prompt.** Sur du silence ou du bruit, Whisper recopie parfois le prompt. Si le texte renvoyé est couvert à 90 % par des morceaux du prompt et reprend au moins 3 de ses termes, la phrase est classée `ignoree_hallucination` et le texte renvoyé à HA est vide.
+
+### Mots mal compris
+
+Dans le Journal, le bouton ⓘ d'une phrase ouvre son détail. « ✎ Corriger le texte » permet de taper ce qui a vraiment été dit.
+- WhoSpeaks compare les deux textes et retient les mots **remplacés** : « impliment » → « imprimante ». Les articles, et les mots oubliés ou en trop, ne comptent pas.
+- Ces mots passent **en tête** du vocabulaire, et sont listés dans l'onglet Vocabulaire (« Mots souvent mal compris »), où l'on peut les retirer.
+- Le texte envoyé à HA reste toujours celui de Whisper : il n'y a pas de remplacement automatique. Le texte corrigé est seulement gardé dans le journal (`transcript_corrige`).
+
+### Temps de chaque étape
+
+Pour chaque phrase, le journal enregistre, en secondes :
+
+| Champ | Mesure |
+|---|---|
+| `duree_audio_s` | audio reçu de HA (du réveil à la fin du flux) |
+| `duree_parole` | parole mesurée par le VAD |
+| `attente_fin_s` | entre la fin de la parole (VAD) et la fin du flux (`AudioStop`) : la détection de fin de parole de HA |
+| `whisper_s` | entre l'`AudioStop` et le texte de Whisper |
+| `identification_s` | identification de la voix (VAD et empreinte, en parallèle de Whisper) |
+| `attente_identification_s` | attente de l'identification après l'arrivée du texte (au plus `ID_EXTRA_WAIT`) |
+| `total_s` | entre le premier paquet audio et le texte renvoyé à HA |
+
+- **Journal** : le temps total et celui de Whisper sont affichés sur chaque phrase, et le détail ⓘ donne les sept mesures. Au-dessus de la liste, une ligne donne, par satellite, la médiane et le 90e percentile sur 24 h du total, de Whisper et de l'attente de fin de parole. API : `GET /api/temps`.
+- **Capteurs HA** : `sensor.whospeaks_temps_whisper` et `sensor.whospeaks_temps_total` (en secondes, avec toutes les mesures en attributs), publiés après chaque phrase sans retarder la réponse.
+- **Phrase sans parole** : la réponse vide part sans attendre Whisper. `whisper_s` reste donc vide.
+
 ## Évaluer les modèles
 
 ```bash

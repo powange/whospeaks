@@ -45,10 +45,16 @@ class Vad:
 
     def speech(self, samples: np.ndarray) -> np.ndarray:
         """Renvoie uniquement les passages de parole, concaténés."""
+        return self.speech_and_end(samples)[0]
+
+    def speech_and_end(self, samples: np.ndarray) -> tuple[np.ndarray, float | None]:
+        """Parole concaténée, et fin de la dernière parole (secondes depuis le début ; None
+        sans parole) : sert à mesurer l'attente entre la fin de la parole et la fin du flux."""
         if len(samples) == 0:
-            return samples
+            return samples, None
         if self._vad is None:
             return _energy_vad(samples)
+        last_end = 0
         with self._lock:
             vad = self._vad
             vad.reset()
@@ -62,23 +68,28 @@ class Vad:
                 vad.accept_waveform(padded[i : i + w])
             vad.flush()
             while not vad.empty():
-                segments.append(np.asarray(vad.front.samples, dtype=np.float32))
+                segment = vad.front
+                segments.append(np.asarray(segment.samples, dtype=np.float32))
+                last_end = max(last_end, segment.start + len(segment.samples))
                 vad.pop()
             vad.reset()
         if not segments:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(segments)
+            return np.zeros(0, dtype=np.float32), None
+        # Le dernier segment peut déborder sur le silence ajouté : borné à l'audio reçu.
+        return np.concatenate(segments), min(last_end, len(samples)) / SAMPLE_RATE
 
 
-def _energy_vad(samples: np.ndarray, frame: int = 480) -> np.ndarray:
+def _energy_vad(samples: np.ndarray, frame: int = 480) -> tuple[np.ndarray, float | None]:
     n = len(samples) // frame
     if n == 0:
-        return samples
+        return samples, len(samples) / SAMPLE_RATE
     frames = samples[: n * frame].reshape(n, frame)
     rms = np.sqrt((frames**2).mean(axis=1) + 1e-12)
     # Seuil relatif au niveau de crête : -20 dB sous le 95e centile, et au moins -46 dBFS.
     keep = rms > max(0.1 * np.percentile(rms, 95), 0.005)
-    return frames[keep].reshape(-1)
+    kept = np.flatnonzero(keep)
+    end = (kept[-1] + 1) * frame / SAMPLE_RATE if len(kept) else None
+    return frames[keep].reshape(-1), end
 
 
 class Embedder:

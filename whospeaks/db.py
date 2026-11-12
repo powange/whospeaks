@@ -79,6 +79,15 @@ CREATE TABLE IF NOT EXISTS ignores (
     phrase_id INTEGER,
     cree_le REAL NOT NULL
 );
+-- Mots mal compris par Whisper, relevés par « Corriger le texte » : ils passent en tête
+-- du vocabulaire donné à Whisper
+CREATE TABLE IF NOT EXISTS corrections_mots (
+    faux TEXT NOT NULL,
+    vrai TEXT NOT NULL,
+    nombre INTEGER NOT NULL DEFAULT 1,
+    derniere REAL NOT NULL,
+    PRIMARY KEY (faux, vrai)
+);
 CREATE TABLE IF NOT EXISTS reglages (
     cle TEXT PRIMARY KEY,
     valeur TEXT NOT NULL
@@ -90,6 +99,15 @@ CREATE TABLE IF NOT EXISTS reglages (
 # ne touche pas une base existante, elles y sont donc ajoutées ici.
 MIGRATIONS = [
     ("phrases", "satellite_entity", "TEXT"),
+    # Texte réellement dit, saisi dans le journal (celui de Whisper reste dans transcript)
+    ("phrases", "transcript_corrige", "TEXT"),
+    # Temps de chaque étape, en secondes (voir proxy.py)
+    ("phrases", "duree_audio_s", "REAL"),
+    ("phrases", "attente_fin_s", "REAL"),
+    ("phrases", "whisper_s", "REAL"),
+    ("phrases", "identification_s", "REAL"),
+    ("phrases", "attente_identification_s", "REAL"),
+    ("phrases", "total_s", "REAL"),
 ]
 
 

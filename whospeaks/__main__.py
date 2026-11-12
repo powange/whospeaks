@@ -11,6 +11,7 @@ from wyoming.server import AsyncServer
 
 from .config import Config
 from .ha import HomeAssistant
+from .ha_ws import vocabulary_loop
 from .proxy import Proxy, ProxyHandler
 from .service import WhoSpeaks
 from .web import create_app
@@ -69,6 +70,9 @@ async def _run(config: Config) -> None:
     tasks = [asyncio.create_task(server.run(partial(ProxyHandler, proxy=proxy)), name="wyoming")]
     if service is not None:
         tasks.append(asyncio.create_task(_maintenance(service), name="maintenance"))
+        if ha.enabled:
+            tasks.append(asyncio.create_task(vocabulary_loop(service, config.ha_url, config.ha_token),
+                                             name="vocabulaire"))
         app = create_app(service, config)
         web = uvicorn.Server(web_server_config(app, config))
         tasks.append(asyncio.create_task(web.serve(), name="web"))
