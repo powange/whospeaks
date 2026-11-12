@@ -107,7 +107,7 @@ class HomeAssistant:
         attributes = {
             "unit_of_measurement": "s", "device_class": "duration", "state_class": "measurement",
             "satellite": satellite, "resultat": resultat,
-            **{k: None if v is None else round(v, 3) for k, v in temps.items()},
+            **{k: round(v, 3) if isinstance(v, float) else v for k, v in temps.items()},
         }
         posts = []
         for key, entity, label in (("whisper_s", "sensor.whospeaks_temps_whisper", "Temps Whisper"),

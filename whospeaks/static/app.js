@@ -193,12 +193,14 @@ const TIMINGS = [
   ["duree_audio_s", "Audio reçu de HA"],
   ["duree_parole", "Parole (VAD)"],
   ["retard_audio_s", "Retard pris par l'audio de HA pendant la phrase (horloge de l'audio / horloge murale)"],
-  ["blocage_boucle_s", "Plus long blocage de WhoSpeaks pendant la phrase"],
+  ["blocage_boucle_s", "Plus long blocage de WhoSpeaks (du début de la phrase à l'envoi du texte)"],
   ["attente_fin_s", "Attente fin de parole → fin du flux (détection de HA)"],
   ["relais_whisper_s", "Relais de la fin du flux vers Whisper"],
+  ["gain_anticipation_s", "Gagné par la transcription anticipée"],
   ["whisper_s", "Whisper (fin du flux reçue → texte)"],
   ["identification_s", "Identification de la voix"],
   ["attente_identification_s", "Attente de l'identification après Whisper"],
+  ["envoi_s", "Réponse de Whisper → texte écrit vers HA"],
   ["total_s", "Total (premier paquet audio → texte renvoyé à HA)"],
 ];
 const sec = (v) => (v === null || v === undefined) ? "—" : `${v.toFixed(v < 10 ? 2 : 1)} s`;
@@ -207,8 +209,11 @@ function timingCell(p) {
   if (p.total_s === null || p.total_s === undefined) return h("div", { class: "temps muted" }, "");
   return h("div", { class: "temps", title: "Temps total, dont Whisper" },
     h("div", {}, `⏱ ${sec(p.total_s)}`),
-    p.whisper_s !== null ? h("div", { class: "muted" }, `Whisper ${sec(p.whisper_s)}`) : null);
+    p.whisper_s !== null ? h("div", { class: "muted" }, `Whisper ${sec(p.whisper_s)}`) : null,
+    p.anticipation === "utilisee" ? h("div", { class: "muted", title: "Transcription anticipée utilisée" }, `⚡ −${sec(p.gain_anticipation_s)}`) : null);
 }
+
+const ANTICIPATION = { utilisee: "utilisée", abandonnee: "abandonnée (la parole a repris)", aucune: "aucune" };
 
 function phraseDetails(p) {
   const corriger = () => {
@@ -220,7 +225,9 @@ function phraseDetails(p) {
     });
   };
   return h("div", { class: "details" },
-    h("table", {}, TIMINGS.map(([k, l]) => h("tr", {}, h("td", { class: "muted" }, l), h("td", {}, sec(p[k]))))),
+    h("table", {}, TIMINGS.map(([k, l]) => h("tr", {}, h("td", { class: "muted" }, l), h("td", {}, sec(p[k])))),
+      p.anticipation ? h("tr", {}, h("td", { class: "muted" }, "Transcription anticipée"),
+        h("td", {}, (ANTICIPATION[p.anticipation] || p.anticipation) + (p.anticipations_abandonnees ? ` · ${p.anticipations_abandonnees} abandonnée(s)` : ""))) : null),
     h("div", { class: "row" },
       p.transcript ? h("button", { onclick: corriger }, "✎ Corriger le texte") : null,
       h("span", { class: "muted" }, "Le texte envoyé à HA reste celui de Whisper ; les mots corrigés passent en tête du vocabulaire.")));
@@ -233,7 +240,7 @@ function timingStats(stats) {
   const pair = (v) => v ? `${v.mediane.toFixed(1)} / ${v.p90.toFixed(1)} s` : "—";
   return h("div", { class: "stats muted" }, "Temps sur 24 h (médiane / 90 %) : ",
     rows.map((x) => h("span", { class: "badge none", title: `${x.phrases} phrase(s)` },
-      `${x.satellite ?? "?"} : total ${pair(x.total_s)} · Whisper ${pair(x.whisper_s)} · fin de parole ${pair(x.attente_fin_s)} · retard de l'audio ${pair(x.retard_audio_s)}`)));
+      `${x.satellite ?? "?"} : total ${pair(x.total_s)} · Whisper ${pair(x.whisper_s)} · fin de parole ${pair(x.attente_fin_s)} · retard de l'audio ${pair(x.retard_audio_s)} · gagné par anticipation ${pair(x.gain_anticipation_s)}`)));
 }
 
 // --- Vocabulaire ---
@@ -500,6 +507,8 @@ const FIELDS = [
   ["reprise_active", "Reprendre l'interlocuteur sur les phrases trop courtes", "checkbox"],
   ["reprise_duree_s", "Durée de reprise (s, 0 à 600)", "number", 1, [0, 600]],
   ["enrolement_silencieux", "Jarvis ne répond pas pendant un enrôlement", "checkbox"],
+  ["anticipation_active", "Transcription anticipée (Whisper démarre au premier silence)", "checkbox"],
+  ["anticipation_silence_s", "Silence avant la transcription anticipée (s, 0,1 à 2)", "number", 0.05, [0.1, 2]],
   ["filtre_silence_actif", "Ne rien transcrire quand personne ne parle", "checkbox"],
   ["silence_max_s", "Parole en dessous de laquelle c'est du silence (s, 0 à 2)", "number", 0.05, [0, 2]],
   ["hallucinations", "Textes inventés par Whisper à ignorer (un par ligne ; « ~ » en tête : expression régulière)", "lines"],
@@ -588,11 +597,48 @@ function whisperCard(w) {
     h("table", {}, p.modeles.map((m) => h("tr", {}, h("td", {}, m.nom), h("td", { class: "muted" }, m.description || ""),
       h("td", { class: "muted" }, (m.langues || []).slice(0, 6).join(", ") + ((m.langues || []).length > 6 ? "…" : "")))))))
     : [h("p", { class: "muted" }, "Whisper n'a pas répondu à la demande d'informations.")];
+  const direct = w.mode === "openai";
+  const results = h("div", {});
+  const bench = h("button", { onclick: () => runBench(results) }, "Mesurer Whisper");
+  api("GET", "/api/whisper/banc").then((b) => showBench(results, b)).catch(() => {});
   return h("div", { class: "card" }, h("h2", {}, "Whisper (amont)"),
-    h("p", { class: "muted" }, `${w.amont}${w.lu_le ? ` · lu le ${fmtDate(w.lu_le)}` : ""}`), ...progs,
-    h("p", { class: "muted" }, "Le protocole Wyoming n'annonce ni la taille de faisceau (beam size) ni le type de calcul : " +
+    h("p", {}, direct ? `Mode direct : API OpenAI ${w.openai.url}, modèle « ${w.openai.modele} », prompt du vocabulaire envoyé à chaque phrase.`
+      : `Mode Wyoming : ${w.amont}${w.lu_le ? ` · lu le ${fmtDate(w.lu_le)}` : ""}` + (w.openai ? ` · API OpenAI disponible pour comparaison : ${w.openai.url}` : "")),
+    ...(direct ? [] : progs),
+    w.openai?.derniere_erreur ? h("p", { class: "badge bad" }, w.openai.derniere_erreur) : null,
+    h("p", { class: "muted" }, "Ni Wyoming ni l'API OpenAI n'annoncent la taille de faisceau, le type de calcul ou le périphérique : " +
       "les vérifier dans la commande de whisper-server (voir le README, « Accélérer Whisper »)."),
-    h("button", { onclick: () => act(() => api("GET", "/api/whisper?rafraichir=true"), "Informations relues") }, "Relire"));
+    h("div", { class: "toolbar" },
+      h("button", { onclick: () => act(() => api("GET", "/api/whisper?rafraichir=true"), "Informations relues") }, "Relire"),
+      bench, h("span", { class: "muted" }, "3 extraits en français (2, 4 et 8 s), 3 essais chacun, par chaque chemin vers Whisper.")),
+    results);
+}
+
+async function runBench(target) {
+  try {
+    await api("POST", "/api/whisper/banc");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  const poll = async () => {
+    const b = await api("GET", "/api/whisper/banc");
+    showBench(target, b);
+    if (b.etat === "en_cours") setTimeout(poll, 1000);
+  };
+  poll();
+}
+
+function showBench(target, b) {
+  if (!b || b.etat === "inactif") return;
+  const rows = (b.resultats || []).map((r) => h("tr", {},
+    h("td", {}, r.libelle), h("td", {}, `${r.fichier} (${r.audio_s} s)`),
+    h("td", {}, h("strong", {}, r.mediane_s !== null ? sec(r.mediane_s) : "—")),
+    h("td", { class: "muted" }, r.essais_s.map((t) => sec(t)).join(" · ")),
+    h("td", { class: r.erreur ? "" : "transcript" }, r.erreur ? h("span", { class: "badge bad" }, r.erreur) : (r.texte || ""))));
+  target.replaceChildren(
+    h("p", { class: "muted" }, b.etat === "en_cours" ? `Mesure en cours… ${Math.round((b.progression || 0) * 100)} %`
+      : `Mesure ${b.etat === "termine" ? "terminée" : b.etat} le ${fmtDate(b.fin)}${b.message ? " : " + b.message : ""}`),
+    rows.length ? h("table", {}, h("tr", {}, h("th", {}, "Chemin"), h("th", {}, "Extrait"), h("th", {}, "Médiane"), h("th", {}, "Essais"), h("th", {}, "Texte")), rows) : null);
 }
 
 function taskInfo() {

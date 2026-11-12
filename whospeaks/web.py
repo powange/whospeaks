@@ -135,6 +135,21 @@ def create_app(service: WhoSpeaks, config: Config, proxy=None) -> FastAPI:
             await proxy.get_info()
         return proxy.upstream_summary()
 
+    @app.post("/api/whisper/banc", dependencies=[api])
+    async def whisper_banc(essais: int = 3):
+        """Banc d'essai : extraits de 2, 4 et 8 s, `essais` fois par chemin vers Whisper."""
+        if proxy is None:
+            raise HTTPException(503, "Proxy indisponible")
+        if not proxy.start_bench(max(1, min(essais, 10))):
+            raise HTTPException(409, "Un banc d'essai est déjà en cours")
+        return proxy.bench
+
+    @app.get("/api/whisper/banc", dependencies=[api])
+    async def whisper_banc_etat():
+        if proxy is None:
+            raise HTTPException(503, "Proxy indisponible")
+        return proxy.bench
+
     @app.get("/api/modeles", dependencies=[api])
     async def modeles():
         return [{"cle": m.key, "description": m.description} for m in SPEAKER_MODELS.values()]

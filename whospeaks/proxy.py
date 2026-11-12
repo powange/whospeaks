@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import socket
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioChunkConverter, AudioStart, AudioStop
@@ -18,9 +20,12 @@ from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler
 
 from . import __version__
+from .audio import pcm16_to_float, read_wav, float_to_pcm16
+from .engine import SpeechTracker
 from .filters import is_hallucination
 from .ha import SATELLITE_TIMEOUT, HomeAssistant
 from .service import Analysis, WhoSpeaks
+from .transcribe import OpenAITranscriber, SideConnections, pcm_events, wyoming_transcribe
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,8 +43,18 @@ class Proxy:
         lang: str = "fr",
         id_extra_wait: float = 0.15,
         connect_timeout: float = 5.0,
+        openai: OpenAITranscriber | None = None,
+        direct: bool = False,
     ) -> None:
         self.upstream_uri = upstream_uri
+        # Mode direct : transcription par l'API OpenAI du serveur Whisper, sans wyoming_openai
+        self.openai = openai
+        self.direct = direct and openai is not None
+        # Connexions de transcription à part (anticipation, banc d'essai) encore ouvertes
+        self.side = SideConnections()
+        # Un seul thread : les morceaux d'une phrase sont suivis dans l'ordre, jamais en parallèle
+        self.vad_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whospeaks-vad")
+        self.bench: dict = {"etat": "inactif"}
         self.service = service
         self.ha = ha
         self.lang = lang
@@ -80,6 +95,8 @@ class Proxy:
                      f" ({sorted(context)})" if context else " (reprise sur l'entrée globale)")
 
     async def get_info(self) -> Info:
+        if self.direct:
+            return self._build_info(None)
         if self._info is not None and time.monotonic() - self._info_time < 60:
             return self._info
         upstream: Info | None = None
@@ -113,13 +130,72 @@ class Proxy:
                 "modeles": [{"nom": m.name, "description": m.description, "version": m.version,
                              "langues": list(m.languages)} for m in p.models],
             })
-        return {"amont": self.upstream_uri, "lu_le": self.upstream_info_at, "programmes": programs}
+        return {"amont": self.upstream_uri, "lu_le": self.upstream_info_at, "programmes": programs,
+                "mode": "openai" if self.direct else "wyoming",
+                "openai": self.openai.info() if self.openai is not None else None}
+
+    # -------------------------------------------------------------- transcriptions à part
+    async def transcribe_wyoming(self, pcm: bytes, transcribe: Event | None = None) -> str:
+        start, chunks = pcm_events(pcm)
+        event = await wyoming_transcribe(self.upstream_uri, transcribe or Transcribe(language=self.lang).event(),
+                                         start, chunks, self.side, self.connect_timeout)
+        return event.data.get("text") or ""
+
+    async def transcribe_openai(self, pcm: bytes) -> str:
+        prompt = self.service.prompt if self.service is not None else ""
+        return await self.openai.transcribe(pcm, prompt, self.side)
+
+    def start_bench(self, essais: int = 3) -> bool:
+        if self.bench.get("etat") == "en_cours":
+            return False
+        self.bench = {"etat": "en_cours", "debut": time.time(), "progression": 0.0, "resultats": []}
+        self.keep(asyncio.create_task(self._bench(essais), name="whospeaks banc"))
+        return True
+
+    async def _bench(self, essais: int) -> None:
+        """Banc d'essai : extraits de 2, 4 et 8 s, `essais` fois, par chaque chemin vers Whisper."""
+        targets = [("wyoming", f"Wyoming ({self.upstream_uri})", self.transcribe_wyoming)]
+        if self.openai is not None:
+            targets.append(("openai", f"API OpenAI ({self.openai.base_url})", self.transcribe_openai))
+        files = sorted(BENCH_DIR.glob("*.wav"), key=lambda f: len(f.read_bytes()))
+        total = max(1, len(targets) * len(files) * essais)
+        done = 0
+        try:
+            for key, label, func in targets:
+                for path in files:
+                    pcm = float_to_pcm16(read_wav(path))
+                    times, text, error = [], None, None
+                    for _ in range(essais):
+                        t0 = time.perf_counter()
+                        try:
+                            text = await asyncio.wait_for(func(pcm), 60)
+                            times.append(time.perf_counter() - t0)
+                        except Exception as err:  # noqa: BLE001
+                            error = f"{type(err).__name__}: {err}"
+                        done += 1
+                        self.bench["progression"] = done / total
+                    self.bench["resultats"].append({
+                        "chemin": key, "libelle": label, "fichier": path.name,
+                        "audio_s": round(len(pcm) / 32000, 2),
+                        "essais_s": [round(t, 3) for t in times],
+                        "mediane_s": round(sorted(times)[len(times) // 2], 3) if times else None,
+                        "texte": text, "erreur": error,
+                    })
+            self.bench.update(etat="termine", fin=time.time())
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Banc d'essai en échec")
+            self.bench.update(etat="erreur", message=str(err), fin=time.time())
 
     def _build_info(self, upstream: Info | None) -> Info:
         models: list[AsrModel] = []
         streaming = False
         description = "WhoSpeaks (reconnaissance du locuteur)"
         version = __version__
+        if self.direct:
+            description = f"WhoSpeaks → Whisper (API OpenAI, {self.openai.model})"
+            models = [AsrModel(name=self.openai.model, attribution=_ATTRIBUTION, installed=True,
+                               description=f"Whisper via {self.openai.base_url}", version=version,
+                               languages=[self.lang])]
         if upstream is not None and upstream.asr:
             prog = upstream.asr[0]
             streaming = prog.supports_transcript_streaming
@@ -159,6 +235,20 @@ class ProxyHandler(AsyncEventHandler):
         self.loop_stall = 0.0
         # Publication anticipée du capteur (dès l'identification, pendant que Whisper travaille)
         self.publish_task: asyncio.Task | None = None
+        # Transcription anticipée : suivi de la parole pendant le flux, transcription lancée au
+        # premier silence, gardée si la parole ne reprend pas avant la fin du flux
+        self.transcribe_event: Event | None = None
+        self.start_event: Event | None = None
+        self.tracker: SpeechTracker | None = None
+        self.vad_converter: AudioChunkConverter | None = None
+        self.vad_lock = asyncio.Lock()
+        self.fed = 0
+        self.anticipation: _Anticipation | None = None
+        self.anticipation_task: asyncio.Task | None = None
+        self.abandoned = 0
+        self.last_cut_end: int | None = None
+        self.finish_task: asyncio.Task | None = None
+        self.main_task: asyncio.Task | None = None
         _nodelay(writer)
         # Satellite de la phrase : pièce (ou nom) affichée, clé (entité HA ou identifiant du
         # contexte) et origine : « context », « ha » ou « inconnu » (None : pas encore connue)
@@ -192,6 +282,7 @@ class ProxyHandler(AsyncEventHandler):
                 # Le contexte de HA reste prioritaire s'il est fourni
                 self._set_satellite(str(from_context), str(from_context), "context")
             event = self._with_terms(event)
+            self.transcribe_event = event
 
         if AudioStart.is_type(event.type):
             self.chunks = []
@@ -204,22 +295,26 @@ class ProxyHandler(AsyncEventHandler):
             self.temps = {}
             self.t_first_chunk = None
             self.sent = None
+            self.start_event = event
             self._ask_satellite()
             self._start_monitor()
+            self._start_anticipation()
 
-        if self.upstream is None and not await self._connect_upstream():
+        if not self.proxy.direct and self.upstream is None and not await self._connect_upstream():
             await self.write_event(Error(text="Serveur STT amont injoignable", code="upstream").event())
             return False
 
         # Relayé tel quel, sans réencodage (transcribe : termes ajoutés), par la file :
-        # on rend la main tout de suite pour lire le morceau suivant de HA.
+        # on rend la main tout de suite pour lire le morceau suivant de HA. La fin du flux
+        # attend la décision sur la transcription anticipée (quelques millisecondes).
         is_stop = AudioStop.is_type(event.type)
-        self.upstream_queue.put_nowait((event, t_recv, self.temps if is_stop else None))
+        if not self.proxy.direct and not is_stop:
+            self.upstream_queue.put_nowait((event, t_recv, None))
 
         if AudioChunk.is_type(event.type):
             self._on_chunk(event, t_recv)
         elif is_stop:
-            self._stop_monitor()
+            self.temps["fin_flux_recue_utc"] = _utc(t_recv)
             self.temps["duree_audio_s"] = self.audio_seconds
             if self.lag_min is not None:
                 # Retard pris par l'audio pendant la phrase : la fin arrive d'autant plus tard
@@ -227,8 +322,221 @@ class ProxyHandler(AsyncEventHandler):
                 self.temps["retard_audio_s"] = max(0.0, self.lag_last - self.lag_min)
             self.temps["blocage_boucle_s"] = self.loop_stall
             self.sent = asyncio.get_running_loop().create_future()
-            self._start_analysis()
+            if self.anticipation_task is not None:
+                self.finish_task = asyncio.create_task(self._finish(t_recv), name="whospeaks fin")
+            else:
+                self.temps["anticipation"] = "aucune"
+                self._relay_stop(t_recv)
+                self._start_analysis()
         return True
+
+    # -------------------------------------------------------------- fin du flux
+    def _relay_stop(self, t_recv: float) -> None:
+        """Transcription complète : fin du flux relayée (Wyoming) ou envoi direct (OpenAI)."""
+        if self.proxy.direct:
+            self.main_task = asyncio.create_task(self._direct_transcription(t_recv), name="whospeaks openai")
+        elif self.upstream_queue is not None:
+            self.upstream_queue.put_nowait((AudioStop().event(), t_recv, self.temps))
+
+    async def _direct_transcription(self, t_recv: float) -> None:
+        self.t_stop = time.perf_counter()
+        self.temps["relais_whisper_s"] = self.t_stop - t_recv
+        try:
+            event = await self._transcribe_chunks(list(self.chunks))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Transcription (API OpenAI) en échec : %s", err)
+            await self._write_error(f"Whisper injoignable : {err}")
+            return
+        await self._send_transcript(event)
+
+    async def _write_error(self, text: str) -> None:
+        if self.replied:
+            return
+        self.replied = True
+        with contextlib.suppress(Exception):
+            await self.write_event(Error(text=text, code="upstream").event())
+        self._mark_sent()
+
+    async def _finish(self, t_recv: float) -> None:
+        """Fin du flux : la transcription anticipée est gardée si la parole n'a pas repris."""
+        task, self.anticipation_task = self.anticipation_task, None
+        if task is not None:
+            task.cancel()
+        if self.anticipation is not None:
+            # Seulement s'il y a une anticipation à valider : sans elle, la fin du flux part
+            # tout de suite (pas d'attente du suivi de la parole)
+            try:
+                await self._vad_catch_up()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Suivi de la parole en échec")
+        a = self.anticipation
+        tracker = self.tracker
+        if a is not None and tracker is not None and tracker.speech_after(a.cut_s) <= _RESUMED_SPEECH_S:
+            await self._use_anticipation(a, t_recv)
+            return
+        if a is not None:
+            self._abandon(a)
+        self.temps["anticipation"] = "abandonnee" if self.abandoned else "aucune"
+        self.temps["anticipations_abandonnees"] = self.abandoned
+        self._relay_stop(t_recv)
+        self._start_analysis()
+
+    async def _use_anticipation(self, a: "_Anticipation", t_recv: float) -> None:
+        self.anticipation = None
+        self.temps["anticipation"] = "utilisee"
+        self.temps["anticipations_abandonnees"] = self.abandoned
+        # Wyoming : la connexion principale est fermée sans fin de flux, Whisper ne transcrit
+        # pas une deuxième fois la même phrase
+        await self._drop_main_upstream()
+        service = self.proxy.service
+        if service is not None and a.analysis_future is not None:
+            self.analysis_future = asyncio.ensure_future(self._adopt_analysis(service, a))
+        try:
+            event = await a.whisper_task
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Transcription anticipée en échec (%s) : transcription complète", err)
+            self.temps["anticipation"] = "abandonnee"
+            self.t_stop = time.perf_counter()
+            try:
+                event = await self._transcribe_chunks(list(self.chunks))
+            except Exception as err2:  # noqa: BLE001
+                await self._write_error(f"Whisper injoignable : {err2}")
+                return
+            await self._send_transcript(event)
+            return
+        # Avance prise sur la fin du flux, au plus le temps de Whisper
+        self.temps["gain_anticipation_s"] = min(a.whisper_s, max(0.0, t_recv - a.t_start))
+        self.temps["relais_whisper_s"] = 0.0
+        self.t_stop = a.t_start
+        await self._send_transcript(event, whisper_s=a.whisper_s)
+
+    async def _adopt_analysis(self, service: WhoSpeaks, a: "_Anticipation") -> Analysis:
+        analysis = await a.analysis_future
+        loop = asyncio.get_running_loop()
+        analysis = await loop.run_in_executor(self.proxy.analyze_pool, service.commit_analysis, analysis,
+                                              self.satellite_entity)
+        self.temps["identification_s"] = a.temps.get("identification_s")
+        if analysis.fin_parole_s is not None:
+            self.temps["attente_fin_s"] = max(0.0, self.temps["duree_audio_s"] - analysis.fin_parole_s)
+        self._publish_early(service, analysis)
+        return analysis
+
+    async def _drop_main_upstream(self) -> None:
+        for task in (self.writer_task, self.upstream_task):
+            if task is not None and not task.done():
+                task.cancel()
+        upstream, self.upstream = self.upstream, None
+        if upstream is not None:
+            with contextlib.suppress(Exception):
+                await upstream.disconnect()
+
+    # -------------------------------------------------------------- anticipation
+    def _start_anticipation(self) -> None:
+        self._stop_anticipation()
+        self.tracker = None
+        self.vad_converter = AudioChunkConverter(rate=16000, width=2, channels=1)
+        self.fed = 0
+        self.abandoned = 0
+        self.last_cut_end = None
+        service = self.proxy.service
+        if service is None or service.vad is None or not service.settings["anticipation_active"]:
+            return
+        self.anticipation_task = asyncio.create_task(self._anticipate(service), name="whospeaks anticipation")
+
+    def _stop_anticipation(self) -> None:
+        if self.anticipation_task is not None and not self.anticipation_task.done():
+            self.anticipation_task.cancel()
+        self.anticipation_task = None
+        if self.anticipation is not None:
+            self._abandon(self.anticipation)
+
+    async def _anticipate(self, service: WhoSpeaks) -> None:
+        """Pendant le flux : suit la parole et lance une transcription au premier silence."""
+        try:
+            while True:
+                await asyncio.sleep(_ANTICIPATION_TICK)
+                await self._vad_catch_up()
+                self._anticipation_step(service)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Transcription anticipée arrêtée")
+
+    async def _vad_catch_up(self) -> None:
+        """Donne au suivi de la parole les morceaux reçus depuis la dernière fois (thread)."""
+        async with self.vad_lock:
+            n = len(self.chunks)
+            new = self.chunks[self.fed:n]
+            if not new:
+                return
+            # Noté avant l'envoi : une annulation pendant le calcul ne fait pas repasser ces
+            # morceaux ; le thread unique les traite dans l'ordre et jusqu'au bout
+            self.fed = n
+            service = self.proxy.service
+            model = service.vad.model_path if service is not None and service.vad is not None else None
+            job = asyncio.get_running_loop().run_in_executor(self.proxy.vad_pool, self._feed, new, model)
+            await asyncio.shield(job)
+
+    def _feed(self, chunks: list, model) -> None:
+        if self.tracker is None:
+            self.tracker = SpeechTracker(model)
+        for rate, width, channels, payload in chunks:
+            audio = self.vad_converter.convert(
+                AudioChunk(rate=rate, width=width, channels=channels, audio=payload)).audio
+            self.tracker.feed(pcm16_to_float(audio))
+
+    def _anticipation_step(self, service: WhoSpeaks) -> None:
+        tracker = self.tracker
+        if tracker is None:
+            return
+        a = self.anticipation
+        if a is not None:
+            if tracker.speech_after(a.cut_s) > _RESUMED_SPEECH_S:
+                self._abandon(a)  # la parole a repris : une autre partira au prochain silence
+            return
+        if (tracker.speech_s >= _ANTICIPATION_MIN_SPEECH_S
+                and tracker.silence_s >= float(service.settings["anticipation_silence_s"])
+                and tracker.speech_end != self.last_cut_end):
+            self.last_cut_end = tracker.speech_end
+            self._launch(service, tracker.position_s)
+
+    def _launch(self, service: WhoSpeaks, cut_s: float) -> None:
+        chunks = list(self.chunks[:self.fed])
+        a = _Anticipation(cut_s=cut_s, t_start=time.perf_counter())
+        a.whisper_task = asyncio.create_task(self._timed_transcription(a, chunks), name="whospeaks anticipée")
+        self.proxy.keep(a.whisper_task)
+        a.analysis_future = asyncio.ensure_future(
+            self._analyze(service, chunks, a.temps, commit=False, publish=False))
+        self.proxy.keep(a.analysis_future)
+        self.anticipation = a
+        _LOGGER.debug("Transcription anticipée lancée à %.2f s", cut_s)
+
+    async def _timed_transcription(self, a: "_Anticipation", chunks: list) -> Event:
+        event = await self._transcribe_chunks(chunks)
+        a.whisper_s = time.perf_counter() - a.t_start
+        return event
+
+    def _abandon(self, a: "_Anticipation") -> None:
+        if a.whisper_task is not None and not a.whisper_task.done():
+            a.whisper_task.cancel()  # ferme sa connexion vers Whisper
+        if a.analysis_future is not None:
+            # Sans effet : l'analyse anticipée ne modifie rien tant qu'elle n'est pas retenue
+            a.analysis_future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        if self.anticipation is a:
+            self.anticipation = None
+        self.abandoned += 1
+
+    async def _transcribe_chunks(self, chunks: list) -> Event:
+        """Transcription complète de ces morceaux sur une connexion à part."""
+        if self.proxy.direct:
+            pcm = await asyncio.get_running_loop().run_in_executor(self.proxy.analyze_pool, _to_pcm, chunks)
+            text = await self.proxy.transcribe_openai(pcm)
+            return Transcript(text=text).event()
+        events = [AudioChunk(rate=r, width=w, channels=c, audio=p).event() for r, w, c, p in chunks]
+        start = self.start_event or AudioStart(rate=16000, width=2, channels=1).event()
+        transcribe = self.transcribe_event or Transcribe(language=self.proxy.lang).event()
+        return await wyoming_transcribe(self.proxy.upstream_uri, transcribe, start, events, self.proxy.side,
+                                        self.proxy.connect_timeout)
 
     def _on_chunk(self, event: Event, t_recv: float) -> None:
         """Note le morceau sans le traiter : horloge de l'audio contre horloge murale."""
@@ -349,7 +657,8 @@ class ProxyHandler(AsyncEventHandler):
             self.silence_task = asyncio.create_task(self._reply_if_silence(self.analysis_future),
                                                     name="whospeaks silence")
 
-    async def _analyze(self, service: WhoSpeaks, chunks: list, temps: dict) -> Analysis:
+    async def _analyze(self, service: WhoSpeaks, chunks: list, temps: dict, commit: bool = True,
+                       publish: bool = True) -> Analysis:
         # Clé de la reprise : le satellite s'il est déjà connu. En pratique HA a répondu
         # (demandé au début de la phrase) ; sinon, pas d'attente : HA lent ou coupé ne doit
         # pas retarder l'identification, et la reprise passe par l'entrée globale.
@@ -358,12 +667,13 @@ class ProxyHandler(AsyncEventHandler):
         t0 = time.perf_counter()
         # Conversion, VAD et empreinte hors de la boucle asyncio
         analysis = await loop.run_in_executor(self.proxy.analyze_pool, _identify, service, chunks,
-                                              self.satellite_entity)
+                                              self.satellite_entity, commit)
         temps["identification_s"] = time.perf_counter() - t0
         if analysis.fin_parole_s is not None and temps.get("duree_audio_s") is not None:
             # La parole est finie, HA continue d'envoyer l'audio jusqu'à sa propre détection
             temps["attente_fin_s"] = max(0.0, temps["duree_audio_s"] - analysis.fin_parole_s)
-        self._publish_early(service, analysis)
+        if publish:
+            self._publish_early(service, analysis)
         return analysis
 
     def _publish_early(self, service: WhoSpeaks, analysis: Analysis) -> None:
@@ -412,10 +722,15 @@ class ProxyHandler(AsyncEventHandler):
         await self.write_event(event)
         self._mark_sent()
 
-    def _mark_sent(self) -> None:
-        """Texte parti vers HA : temps total depuis le premier paquet audio."""
+    def _mark_sent(self, t_sent: float | None = None) -> None:
+        """Texte écrit vers HA : temps total depuis le premier paquet audio, jusqu'à l'écriture."""
+        t_sent = t_sent if t_sent is not None else time.perf_counter()
+        self.temps["texte_envoye_utc"] = _utc(t_sent)
+        # Surveillance de la boucle jusqu'à l'envoi (pas seulement pendant l'audio)
+        self._stop_monitor()
+        self.temps["blocage_boucle_s"] = self.loop_stall
         if self.t_first_chunk is not None:
-            self.temps["total_s"] = time.perf_counter() - self.t_first_chunk
+            self.temps["total_s"] = t_sent - self.t_first_chunk
         if self.sent is not None and not self.sent.done():
             self.sent.set_result(None)
 
@@ -446,10 +761,12 @@ class ProxyHandler(AsyncEventHandler):
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _send_transcript(self, event: Event) -> None:
+    async def _send_transcript(self, event: Event, whisper_s: float | None = None) -> None:
         t_up = time.perf_counter()
         text = event.data.get("text")
-        if self.t_stop:
+        if whisper_s is not None:
+            self.temps["whisper_s"] = whisper_s
+        elif self.t_stop:
             self.temps["whisper_s"] = t_up - self.t_stop
         analysis: Analysis | None = None
         future = self.analysis_future
@@ -480,13 +797,8 @@ class ProxyHandler(AsyncEventHandler):
                          (time.perf_counter() - t_up) * 1000)
             return
 
-        task = self.publish_task
-        if task is not None and not task.done():
-            # Capteur publié dès l'identification : presque toujours fini à l'arrivée du texte.
-            # Sinon, un court délai pour qu'il précède le texte, sans faire attendre HA.
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(asyncio.shield(task), _PUBLISH_GRACE)
-
+        # Rien n'attend HA avant le texte : le capteur, publié dès l'identification (pendant
+        # Whisper), est en général déjà arrivé ; tout le reste se fait après l'envoi.
         out = event
         if analysis is not None:
             # Le texte reste celui de Whisper ; on ajoute seulement des champs.
@@ -494,8 +806,10 @@ class ProxyHandler(AsyncEventHandler):
                                                 "speaker_score": analysis.score}, payload=event.payload)
         self.replied = True
         await self.write_event(out)
-        self._mark_sent()
         t_sent = time.perf_counter()
+        self.temps["envoi_s"] = t_sent - t_up  # réponse de Whisper -> texte écrit vers HA
+        self.temps["whisper_recu_utc"] = _utc(t_up)
+        self._mark_sent(t_sent)
         added_ms = (t_sent - t_up) * 1000
         _LOGGER.info(
             "Phrase : %s (score=%s, marge=%s, parole=%.2fs) | empreinte %.0f ms | whisper %.0f ms | "
@@ -578,7 +892,8 @@ class ProxyHandler(AsyncEventHandler):
 
     async def disconnect(self) -> None:
         self._stop_monitor()
-        for task in (self.upstream_task, self.silence_task, self.writer_task):
+        self._stop_anticipation()
+        for task in (self.upstream_task, self.silence_task, self.writer_task, self.finish_task, self.main_task):
             if task is not None and not task.done():
                 # Le client est parti : inutile d'attendre la suite.
                 task.cancel()
@@ -590,8 +905,38 @@ class ProxyHandler(AsyncEventHandler):
             self.upstream = None
 
 
-# Attente maximale de la publication anticipée du capteur à l'arrivée du texte
-_PUBLISH_GRACE = 0.05
+def _utc(t_perf: float) -> str:
+    """Instant (horloge perf_counter) en heure UTC à la milliseconde, pour comparer avec le
+    debug du pipeline de HA (stt-vad-end, stt-end)."""
+    wall = time.time() - (time.perf_counter() - t_perf)
+    return datetime.datetime.fromtimestamp(wall, datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+# Transcription anticipée : fréquence du suivi, parole minimale avant de la lancer, et
+# parole tolérée après le point de coupe (au-delà, la parole a repris)
+_ANTICIPATION_TICK = 0.05
+_ANTICIPATION_MIN_SPEECH_S = 0.3
+_RESUMED_SPEECH_S = 0.1
+BENCH_DIR = Path(__file__).parent / "bench"
+
+
+class _Anticipation:
+    """Transcription et identification lancées au premier silence, sur l'audio reçu."""
+
+    def __init__(self, cut_s: float, t_start: float) -> None:
+        self.cut_s = cut_s  # fin de l'audio envoyé, en secondes depuis le début du flux
+        self.t_start = t_start
+        self.whisper_task: asyncio.Task | None = None
+        self.analysis_future: asyncio.Future | None = None
+        self.whisper_s = 0.0
+        self.temps: dict = {}
+
+
+def _to_pcm(chunks: list) -> bytes:
+    converter = AudioChunkConverter(rate=16000, width=2, channels=1)
+    pcm = bytearray()
+    for rate, width, channels, payload in chunks:
+        pcm += converter.convert(AudioChunk(rate=rate, width=width, channels=channels, audio=payload)).audio
+    return bytes(pcm)
 
 
 def _nodelay(writer) -> None:
@@ -604,13 +949,9 @@ def _nodelay(writer) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def _identify(service: WhoSpeaks, chunks: list, satellite: str | None) -> Analysis:
+def _identify(service: WhoSpeaks, chunks: list, satellite: str | None, commit: bool = True) -> Analysis:
     """Dans un thread : conversion en 16 kHz mono 16 bits, puis identification."""
-    converter = AudioChunkConverter(rate=16000, width=2, channels=1)
-    pcm = bytearray()
-    for rate, width, channels, payload in chunks:
-        pcm += converter.convert(AudioChunk(rate=rate, width=width, channels=channels, audio=payload)).audio
-    return service.analyze(bytes(pcm), satellite)
+    return service.analyze(_to_pcm(chunks), satellite, commit)
 
 
 def _safe_record(service: WhoSpeaks, analysis: Analysis, text: str | None, satellite: str | None,

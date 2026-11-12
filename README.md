@@ -57,6 +57,7 @@ Portainer ne reconstruit pas toujours une image `build:` lors d'un redéploiemen
    | `WHOSPEAKS_HA_TOKEN` | oui | — |
    | `WHOSPEAKS_UI_TOKEN` | oui | — |
    | `UPSTREAM_URI` | non | `tcp://192.168.0.11:10301` (Whisper du GEEKOM) |
+   | `UPSTREAM_OPENAI_URL` | non | vide ; `http://192.168.0.11:8091/v1` pour le mode direct |
    | `HA_URL` | non | `http://192.168.0.201:8123` |
    | `FRAME_ANCESTORS` | non | `https://ha.powange.com` |
    | `TRUSTED_PROXIES` | non | vide : aucun proxy de confiance. Mettre l'IP de NPM si la page passe par lui |
@@ -74,6 +75,9 @@ En cas de problème, le tag `:sha-<commit>` permet de revenir temporairement à 
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `UPSTREAM_URI` | `tcp://wyoming-whisper-gpu:10300` | serveur STT Wyoming amont |
+| `UPSTREAM_OPENAI_URL` | — | mode direct : API OpenAI de `whisper-server`, ex. `http://192.168.0.11:8091/v1` (voir « Mode direct ») |
+| `UPSTREAM_OPENAI_MODEL` | `whisper-1` | modèle envoyé à l'API OpenAI |
+| `UPSTREAM_MODE` | `auto` | `auto`, `wyoming` ou `openai` |
 | `HA_URL` | — | ex. `http://192.168.0.201:8123` |
 | `HA_TOKEN` | — | jeton longue durée HA |
 | `UI_TOKEN` | — | jeton de la page et de l'API (en-tête `Authorization: Bearer`, `X-Token` ou `?token=`) |
@@ -251,42 +255,85 @@ Pour chaque phrase, le journal enregistre, en secondes :
 |---|---|
 | `duree_audio_s` | audio reçu de HA (du réveil à la fin du flux) |
 | `duree_parole` | parole mesurée par le VAD |
+| `retard_audio_s` | retard pris par l'audio de HA pendant la phrase : écart entre l'horloge de l'audio (ce que HA a envoyé) et l'horloge murale, entre le moment le mieux calé et la fin |
 | `attente_fin_s` | entre la fin de la parole (VAD) et la fin du flux (`AudioStop`) : la détection de fin de parole de HA |
-| `whisper_s` | entre l'`AudioStop` et le texte de Whisper |
+| `relais_whisper_s` | entre la fin du flux reçue de HA et son envoi à Whisper |
+| `whisper_s` | temps propre de Whisper : de la fin du flux envoyée (ou du lancement de la transcription anticipée) jusqu'au texte |
 | `identification_s` | identification de la voix (VAD et empreinte, en parallèle de Whisper) |
 | `attente_identification_s` | attente de l'identification après l'arrivée du texte (au plus `ID_EXTRA_WAIT`) |
-| `total_s` | entre le premier paquet audio et le texte renvoyé à HA |
-| `retard_audio_s` | retard pris par l'audio de HA pendant la phrase : écart entre l'horloge de l'audio (ce que HA a envoyé) et l'horloge murale, entre le moment le mieux calé et la fin |
-| `blocage_boucle_s` | plus long blocage de WhoSpeaks pendant la phrase (lecture de HA retardée d'autant) |
-| `relais_whisper_s` | entre la fin du flux reçue de HA et son envoi à Whisper (file d'attente du relais) |
+| `envoi_s` | entre la réponse de Whisper et l'écriture du texte vers HA |
+| `gain_anticipation_s` | temps gagné par la transcription anticipée |
+| `total_s` | entre le premier paquet audio et l'écriture du texte vers HA |
+| `blocage_boucle_s` | plus long blocage de WhoSpeaks, du début de la phrase à l'envoi du texte |
+
+S'y ajoutent `anticipation` (`utilisee`, `abandonnee` ou `aucune`) et le nombre de transcriptions anticipées abandonnées.
+
+- **Journal** : le temps total et celui de Whisper sont affichés sur chaque phrase (⚡ quand la transcription anticipée a servi), et le détail ⓘ donne toutes les mesures. Au-dessus de la liste, une ligne donne, par satellite, la médiane et le 90e percentile sur 24 h. API : `GET /api/temps`.
+- **Capteurs HA** : `sensor.whospeaks_temps_whisper` et `sensor.whospeaks_temps_total` (en secondes, avec toutes les mesures en attributs), publiés après chaque phrase sans retarder la réponse. Ils portent aussi trois **heures UTC à la milliseconde** : `fin_flux_recue_utc`, `whisper_recu_utc` et `texte_envoye_utc`.
+- **Phrase sans parole** : la réponse vide part sans attendre Whisper. `whisper_s` reste donc vide.
 
 **Lire ces mesures.**
-- Si `retard_audio_s` grandit alors que `blocage_boucle_s` reste à quelques millisecondes, c'est HA (ou le satellite) qui envoie l'audio plus lentement que le temps réel, pas WhoSpeaks. HA détecte alors la fin de parole d'autant plus tard.
-- `whisper_s` est le temps propre de Whisper : de l'arrivée de la fin du flux chez Whisper jusqu'au texte.
-- Pour comparer, passer le pipeline sur `stt.whisper_gpu` (port 10301, sans WhoSpeaks) et regarder l'écart entre l'horodatage de `stt-vad-end` et son heure dans le debug du pipeline. S'il reste de 1 s, le retard ne vient pas de WhoSpeaks.
+- Si `retard_audio_s` grandit alors que `blocage_boucle_s` reste à quelques millisecondes, c'est HA (ou le satellite) qui envoie l'audio plus lentement que le temps réel. HA détecte alors la fin de parole d'autant plus tard.
+- **Comparer `texte_envoye_utc` à `stt-end`** dans le debug du pipeline de HA. S'il y a plus de quelques dizaines de millisecondes d'écart alors que `envoi_s` et `blocage_boucle_s` sont faibles, le texte a attendu entre WhoSpeaks et HA : réseau, ou boucle de HA occupée à ce moment-là. De même, `fin_flux_recue_utc` doit tomber juste après `stt-vad-end`.
+- Pour comparer sans WhoSpeaks, passer le pipeline sur `stt.whisper_gpu` (port 10301).
 
 ### Ce que WhoSpeaks fait pour ne rien retarder
 
-- **Lecture de HA sans blocage.** Chaque morceau d'audio est seulement mis en file vers Whisper et noté. Une tâche à part écrit vers Whisper, au rythme qu'il accepte : un Whisper lent ne ralentit pas la lecture de HA, donc pas sa détection de fin de parole. La conversion, le VAD et l'empreinte tournent dans un thread, à la fin de la phrase ; sherpa-onnx y libère Python (moins de 5 ms de blocage mesuré). Le journal, l'écriture du WAV et les appels à HA tournent dans d'autres tâches ou threads. La page web ne fait plus de requête à la base dans la boucle du proxy.
+- **Lecture de HA sans blocage.** Chaque morceau d'audio est seulement mis en file vers Whisper et noté. Une tâche à part écrit vers Whisper, au rythme qu'il accepte : un Whisper lent ne ralentit pas la lecture de HA, donc pas sa détection de fin de parole. La conversion, le VAD et l'empreinte tournent dans des threads ; sherpa-onnx y libère Python (moins de 5 ms de blocage mesuré). Le journal, l'écriture du WAV et les appels à HA tournent dans d'autres tâches ou threads. La page web ne fait pas de requête à la base dans la boucle du proxy.
 - **Relais en flux.** Chaque morceau part vers Whisper dès sa réception, avec `TCP_NODELAY` sur les deux connexions.
-- **Texte envoyé sans attendre.** Le capteur `sensor.jarvis_interlocuteur` est publié dès que la voix est identifiée, pendant que Whisper transcrit. À l'arrivée du texte, WhoSpeaks attend l'identification au plus `ID_EXTRA_WAIT` (0,15 s), et pas du tout HA. L'événement `jarvis_interlocuteur` (avec le texte) part juste après le texte.
+- **Le texte part en premier.** À l'arrivée du texte de Whisper, WhoSpeaks attend l'identification au plus `ID_EXTRA_WAIT` (0,15 s ; elle est en pratique déjà prête), et rien de HA. Le texte est écrit tout de suite. Le capteur `sensor.jarvis_interlocuteur` a été publié dès l'identification, pendant que Whisper transcrivait. L'événement `jarvis_interlocuteur`, les capteurs de temps, le journal et le WAV viennent après.
   - Une phrase dont le texte est ensuite jugé inventé (« Merci. ») a donc déjà mis le capteur à jour, sans événement.
   - Si l'identification n'est pas prête, le texte part sans locuteur, et le capteur suit dès qu'elle l'est.
 
+### Transcription anticipée
+
+HA met en général 0,7 à 1,7 s à déclarer la fin de parole (`attente_fin_s`). WhoSpeaks fait travailler Whisper pendant ce temps (réglage `anticipation_active`, activé par défaut) :
+1. Pendant le flux, WhoSpeaks suit la parole (Silero, dans un thread). Dès `anticipation_silence_s` de silence après au moins 0,3 s de parole (0,4 s par défaut, réglable de 0,1 à 2 s), il lance une transcription de l'audio reçu jusque-là, **sur une connexion à part** vers Whisper. L'identification de la voix part en même temps, sur le même audio, sans rien modifier tant qu'elle n'est pas retenue (pas de groupe de voix inconnue, pas de mémoire de reprise).
+2. Si la parole reprend (plus de 0,1 s) avant la fin du flux, cette transcription est **abandonnée** et sa connexion fermée. Une nouvelle partira au silence suivant ; il n'y en a jamais plus d'une à la fois.
+3. À l'`audio-stop` de HA, si la parole n'a pas repris, le texte anticipé est renvoyé dès qu'il est prêt, ou tout de suite s'il l'est déjà. La connexion principale vers Whisper est alors fermée sans fin de flux : Whisper ne transcrit pas deux fois. Sinon, la transcription complète part comme avant.
+
+Le journal note `anticipation` (`utilisee`, `abandonnee`, `aucune`) et `gain_anticipation_s`, l'avance prise sur la fin du flux, au plus le temps de Whisper.
+
+**Le coût.** Une transcription abandonnée ne peut pas être interrompue chez Whisper : `wyoming_openai` a déjà envoyé sa requête à `whisper-server`, qui va au bout. Comme `whisper-server` traite une requête à la fois, une transcription abandonnée peut retarder la suivante d'autant. Si le journal montre beaucoup d'abandons (personne qui marque des pauses), monter `anticipation_silence_s` à 0,6 ou 0,8 s.
+
+### Mode direct (API OpenAI de Whisper)
+
+La chaîne par défaut compte trois étages : WhoSpeaks → `wyoming_openai` (`wyoming-whisper-gpu`, port 10301) → `whisper-server` (API OpenAI, port 8091). Avec `UPSTREAM_OPENAI_URL`, WhoSpeaks appelle directement l'API OpenAI de `whisper-server` :
+- un étage de moins : un seul POST `audio/transcriptions` par phrase, en WAV 16 kHz ;
+- le **prompt du vocabulaire est envoyé à chaque requête**, plus besoin de `STT_PROMPT` ni de redémarrage ;
+- la transcription anticipée fonctionne de la même façon.
+
+```yaml
+UPSTREAM_OPENAI_URL: http://192.168.0.11:8091/v1
+UPSTREAM_OPENAI_MODEL: whisper-1   # nom envoyé dans le champ « model »
+```
+
+`whisper-server` écoute en principe sur `127.0.0.1` : pour le joindre depuis le Beelink, le lancer avec `--host 0.0.0.0`, et ouvrir le port 8091 dans le pare-feu de Windows, en réseau privé seulement.
+
+`UPSTREAM_MODE` force le chemin : `wyoming` garde `wyoming_openai` même si l'adresse est donnée (pour comparer au banc d'essai), `openai` exige le mode direct. Par défaut (`auto`), le mode direct est pris dès que `UPSTREAM_OPENAI_URL` est défini. Si le mode direct échoue (Whisper injoignable), HA reçoit une erreur, comme avec Wyoming.
+
+### Mesurer Whisper (banc d'essai)
+
+Le bouton **« Mesurer Whisper »** de l'onglet Réglages envoie trois extraits en français de 2, 4 et 8 s (fournis dans le dépôt, `whospeaks/bench/`, domaine public), trois fois chacun. Il affiche le temps médian, les essais et le texte obtenu, **pour chaque chemin** :
+- Wyoming (`UPSTREAM_URI`, donc à travers `wyoming_openai`) ;
+- API OpenAI directe, si `UPSTREAM_OPENAI_URL` est défini.
+
+L'écart entre les deux lignes est le coût de `wyoming_openai`. API : `POST /api/whisper/banc`, puis `GET /api/whisper/banc`. Le refaire après chaque changement de modèle ou de réglage de `whisper-server`.
+
 ### Accélérer Whisper
 
-L'onglet Réglages affiche ce que Whisper annonce (programme, modèles, version). Le protocole Wyoming ne transmet ni la taille de faisceau, ni le type de calcul, ni le fichier de modèle : il faut les vérifier dans la commande qui lance `whisper-server` (whisper.cpp) sur le GEEKOM.
-- **Modèle** : c'est le levier principal. `large-v3-turbo` (ou `large-v3-turbo-q5_0`, 547 Mo) a un décodeur de 4 couches au lieu de 32. Il est plusieurs fois plus rapide que `large-v3`, pour une qualité très proche en français. Le télécharger avec `models/download-ggml-model.sh large-v3-turbo`, puis le passer avec `-m`.
-- **Faisceau** : `whisper-server` décode en glouton par défaut (`-bs -1`). Si la commande contient `-bs 5` (ou plus), la retirer ou passer `-bs 1` : la recherche en faisceau multiplie le temps de décodage.
-- **Repli en température** : sans `-nf`, une phrase difficile peut être décodée plusieurs fois. `-nf` (`--no-fallback`) l'évite.
+L'onglet Réglages affiche ce que Whisper annonce (programme, modèles, version). Ni Wyoming ni l'API OpenAI n'annoncent la taille de faisceau, le type de calcul ou le périphérique : il faut les vérifier dans la commande qui lance `whisper-server` (whisper.cpp, Vulkan) sur le GEEKOM.
+
+Réglages conseillés pour le Ryzen AI 9 HX 370 et sa Radeon 890M :
+- **Modèle `large-v3-turbo`** au lieu de `large-v3` : c'est le levier principal. Son décodeur a 4 couches au lieu de 32, il est plusieurs fois plus rapide pour une qualité très proche en français. Le télécharger avec `models/download-ggml-model.sh large-v3-turbo`, puis le passer avec `-m`.
+- **Quantification** : whisper.cpp n'a pas de « compute type » comme faster-whisper ; l'équivalent est le fichier de modèle. `ggml-large-v3-turbo-q8_0.bin` (proche de `int8`) ou `-q5_0` (547 Mo), contre `f16` par défaut (proche de `float16`). La 890M partageant la mémoire vive, un modèle plus léger y est souvent plus rapide. Comparer au banc d'essai.
+- **Faisceau 1** : `whisper-server` décode en glouton par défaut (`-bs -1`). Si la commande contient `-bs 5`, la retirer ou passer `-bs 1`.
+- **Pas de repli en température** : `-nf` (`--no-fallback`), sinon une phrase difficile peut être décodée plusieurs fois.
 - **Flash attention** : `-fa`, si la version et le pilote Vulkan le permettent.
-- **Prompt** : `whisper-server` accepte aussi `--prompt`, et le champ `prompt` à chaque requête, que `wyoming_openai` remplit avec `STT_PROMPT` (voir « Vocabulaire de la maison »).
+- **À défaut**, `medium`, qui reste correct en français.
+- **Ollama partage la même puce** (ministral-3:8b toujours chargé) : mémoire et calcul sont communs. Le pipeline enchaîne Whisper puis Ollama, mais une réponse d'Ollama en cours ralentit une transcription qui démarre.
 
-Pour vérifier le gain : regarder `whisper_s` dans le journal, ou `sensor.whospeaks_temps_whisper`, avant et après.
-
-- **Journal** : le temps total et celui de Whisper sont affichés sur chaque phrase, et le détail ⓘ donne les sept mesures. Au-dessus de la liste, une ligne donne, par satellite, la médiane et le 90e percentile sur 24 h du total, de Whisper et de l'attente de fin de parole. API : `GET /api/temps`.
-- **Capteurs HA** : `sensor.whospeaks_temps_whisper` et `sensor.whospeaks_temps_total` (en secondes, avec toutes les mesures en attributs), publiés après chaque phrase sans retarder la réponse.
-- **Phrase sans parole** : la réponse vide part sans attendre Whisper. `whisper_s` reste donc vide.
+Le conteneur `wyoming-whisper-gpu` et `whisper-server.exe` ne font pas partie de ce dépôt : ces réglages se changent dans la commande de `whisper-server` sur le GEEKOM. Pour vérifier le gain : le banc d'essai, ou `whisper_s` dans le journal.
 
 ## Évaluer les modèles
 

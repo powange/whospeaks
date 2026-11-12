@@ -62,6 +62,7 @@ def slow_relay(monkeypatch):
 
 async def test_ha_audio_read_on_time_with_slow_whisper(service, whisper, slow_relay):  # noqa: F811
     w, uri = whisper
+    service.update_settings({"anticipation_active": False})  # chemin complet
     w.delay = 2.0
     server, port = await start_proxy(Proxy(uri, service, None))
     event, t_stop, t_recv = await ha_client(port, phrase(3.0))
@@ -81,6 +82,7 @@ async def test_ha_audio_read_on_time_with_slow_whisper(service, whisper, slow_re
 
 async def test_transcript_not_delayed_by_slow_identification(service, whisper):  # noqa: F811
     w, uri = whisper
+    service.update_settings({"anticipation_active": False})  # chemin complet
     w.delay = 0.3
     real = service.analyze
 
@@ -106,6 +108,7 @@ async def test_transcript_not_delayed_by_slow_identification(service, whisper): 
 
 async def test_timings_match_fake_whisper(service, whisper):  # noqa: F811
     w, uri = whisper
+    service.update_settings({"anticipation_active": False})  # chemin complet
     w.delay = 0.5
     server, port = await start_proxy(Proxy(uri, service, None))
     _, t_stop, t_recv = await ha_client(port, phrase(2.0))
@@ -139,3 +142,37 @@ async def test_tcp_nodelay_on_both_sockets(service, whisper):  # noqa: F811
         proxymod._nodelay = original
     assert len(seen) == 2 and all(seen)  # socket de HA et socket vers Whisper
     server.close()
+
+
+@pytest.mark.parametrize("kind, expected", [("pierre", "identifie"), ("lea", "inconnu"), ("court", "trop_court")])
+@pytest.mark.parametrize("anticipation", [True, False])
+async def test_transcript_sent_first(service, whisper, kind, expected, anticipation):  # noqa: F811
+    """Le texte part vers HA moins de 50 ms après la réponse de Whisper, quel que soit le
+    résultat de l'identification ; capteurs, journal et WAV viennent après."""
+    import httpx
+
+    from tests.test_proxy import transcribe
+
+    w, uri = whisper
+    w.delay = 0.5
+    service.update_settings({"anticipation_active": anticipation})
+    pid = service.create_person("Pierre")
+    service.add_audio_samples(pid, voice(PIERRE, 8.0, seed=1), "fichier")
+    fake = FakeHA()
+    ha = HomeAssistant("http://ha.test", "jeton", "sensor.jarvis_interlocuteur", "jarvis_interlocuteur")
+    ha._client = httpx.AsyncClient(base_url="http://ha.test", transport=fake.transport())
+    server, port = await start_proxy(Proxy(uri, service, ha))
+    freq, seconds = {"pierre": (PIERRE, 2.0), "lea": (230.0, 2.0), "court": (PIERRE, 0.6)}[kind]
+    event, _, t_recv = await transcribe(port, float_to_pcm16(voice(freq, seconds, seed=3)))
+    assert event.data["text"]
+    assert t_recv - w.sent_at[-1] < 0.05
+    await asyncio.sleep(0.4)
+    row = service.list_phrases(1)[0]
+    assert row["resultat"] == expected
+    assert row["envoi_s"] < 0.05
+    # total_s va jusqu'à l'écriture du texte : il contient l'envoi
+    assert row["total_s"] >= row["whisper_s"] + row["envoi_s"] - 0.01
+    timing = dict(fake.timing_calls)["/api/states/sensor.whospeaks_temps_total"]["attributes"]
+    assert timing["texte_envoye_utc"].endswith("+00:00") and timing["envoi_s"] == pytest.approx(row["envoi_s"], abs=0.002)
+    server.close()
+    await ha.close()

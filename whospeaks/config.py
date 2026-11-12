@@ -37,6 +37,11 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class Config:
     upstream_uri: str = "tcp://wyoming-whisper-gpu:10300"
+    # Mode direct : API OpenAI du serveur Whisper (ex. http://192.168.0.11:8091/v1), sans
+    # passer par wyoming_openai ; « auto » l'utilise dès que l'adresse est donnée
+    upstream_openai_url: str = ""
+    upstream_openai_model: str = "whisper-1"
+    upstream_mode: str = "auto"
     wyoming_uri: str = "tcp://0.0.0.0:10302"
     web_host: str = "0.0.0.0"
     web_port: int = 8095
@@ -61,6 +66,13 @@ class Config:
     log_level: str = "INFO"
 
     @property
+    def openai_direct(self) -> bool:
+        """Transcription par l'API OpenAI du serveur Whisper plutôt que par Wyoming."""
+        if self.upstream_mode == "wyoming" or not self.upstream_openai_url:
+            return False
+        return True
+
+    @property
     def db_path(self) -> Path:
         return self.data_dir / "whospeaks.db"
 
@@ -78,6 +90,9 @@ class Config:
         frame = [o.strip() for o in env("FRAME_ANCESTORS", "").split() if o.strip()]
         return cls(
             upstream_uri=env("UPSTREAM_URI", cls.upstream_uri),
+            upstream_openai_url=env("UPSTREAM_OPENAI_URL", "").rstrip("/"),
+            upstream_openai_model=env("UPSTREAM_OPENAI_MODEL", cls.upstream_openai_model),
+            upstream_mode=env("UPSTREAM_MODE", cls.upstream_mode).lower(),
             wyoming_uri=env("WYOMING_URI", cls.wyoming_uri),
             web_host=env("WEB_HOST", cls.web_host),
             web_port=int(env("WEB_PORT", str(cls.web_port))),
@@ -130,6 +145,9 @@ DEFAULT_SETTINGS: dict = {
     "reprise_duree_s": 120,
     # Pendant un enrôlement, texte vide renvoyé à HA : Jarvis ne répond pas aux phrases lues.
     "enrolement_silencieux": True,
+    # Transcription anticipée : lancée après ce silence, pendant que HA attend la fin de parole
+    "anticipation_active": True,
+    "anticipation_silence_s": 0.4,
     # Pas de parole (VAD) ou texte inventé par Whisper : transcript vide, HA ne répond pas.
     "filtre_silence_actif": True,
     "silence_max_s": 0.3,
@@ -152,6 +170,7 @@ DEFAULT_SETTINGS: dict = {
 _BOUNDS: dict[str, tuple[float, float]] = {
     "reprise_duree_s": (0, 600),
     "silence_max_s": (0, 2),
+    "anticipation_silence_s": (0.1, 2),
     "vocab_max_tokens": (20, 224),
 }
 

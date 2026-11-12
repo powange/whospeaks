@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.0
+
+### Latence
+
+- **Transcription anticipée** (`anticipation_active`, activée par défaut).
+  - Dès `anticipation_silence_s` de silence après de la parole (0,4 s), Whisper transcrit l'audio reçu, sur une connexion à part, pendant que HA attend pour déclarer la fin de parole. L'identification part en même temps, sans effet tant qu'elle n'est pas retenue.
+  - Abandon si la parole reprend, une seule à la fois. À l'`audio-stop`, le texte anticipé est renvoyé dès qu'il est prêt, et Whisper ne transcrit pas une deuxième fois.
+  - Journal : `anticipation` (`utilisee`, `abandonnee`, `aucune`), nombre d'abandons, `gain_anticipation_s`.
+- **Le texte part en premier.** Plus aucune attente de HA avant le texte : il n'y a plus la courte attente du capteur publié pendant Whisper. Nouvelle mesure `envoi_s` (réponse de Whisper → texte écrit vers HA) ; `total_s` va jusqu'à cette écriture. La surveillance de la boucle couvre la phrase jusqu'à l'envoi du texte.
+- **Heures UTC à la milliseconde** dans le capteur de temps (`fin_flux_recue_utc`, `whisper_recu_utc`, `texte_envoye_utc`), à comparer avec `stt-vad-end` et `stt-end` du debug du pipeline de HA.
+- **Mode direct** `UPSTREAM_OPENAI_URL` : WhoSpeaks appelle l'API OpenAI de `whisper-server` sans passer par `wyoming_openai`, avec le prompt du vocabulaire à chaque requête. `UPSTREAM_MODE` : `auto`, `wyoming` ou `openai`.
+
+### Mesures
+
+- **Banc d'essai « Mesurer Whisper »** (onglet Réglages, `POST /api/whisper/banc`) : trois extraits en français de 2, 4 et 8 s (domaine public, dans `whospeaks/bench/`), trois essais chacun, médiane, pour chaque chemin (Wyoming et API OpenAI directe).
+- La carte Whisper indique le mode utilisé et l'adresse de l'API OpenAI.
+- README : transcription anticipée, mode direct, banc d'essai, réglages conseillés de `whisper-server` pour le GEEKOM (modèle turbo, quantification, faisceau, repli en température).
+
 ## 0.7.0
 
 ### Latence

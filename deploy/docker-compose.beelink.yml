@@ -12,6 +12,8 @@ services:
       - "8095:8095"     # page web (optionnel si NPM passe par le réseau Docker)
     environment:
       UPSTREAM_URI: ${UPSTREAM_URI:-tcp://192.168.0.11:10301}
+      # Mode direct (sans wyoming_openai) : API OpenAI de whisper-server, voir README
+      UPSTREAM_OPENAI_URL: ${UPSTREAM_OPENAI_URL:-}
       HA_URL: ${HA_URL:-http://192.168.0.201:8123}
       HA_TOKEN: ${WHOSPEAKS_HA_TOKEN}
       UI_TOKEN: ${WHOSPEAKS_UI_TOKEN}

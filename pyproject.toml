@@ -1,6 +1,6 @@
 [project]
 name = "whospeaks"
-version = "0.7.0"
+version = "0.8.0"
 description = "Reconnaissance du locuteur pour Home Assistant (proxy STT Wyoming)"
 requires-python = ">=3.11"
 dependencies = [
@@ -30,7 +30,7 @@ build-backend = "setuptools.build_meta"
 include = ["whospeaks*"]
 
 [tool.setuptools.package-data]
-whospeaks = ["static/*"]
+whospeaks = ["static/*", "bench/*.wav", "bench/README.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

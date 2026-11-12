@@ -25,6 +25,8 @@ class Vad:
     def __init__(self, model_path: Path | None) -> None:
         self._lock = threading.Lock()
         self._vad = None
+        # Repris par le suivi de la parole en continu (une instance Silero par phrase)
+        self.model_path = model_path
         if model_path is not None:
             import sherpa_onnx
 
@@ -113,3 +115,94 @@ class Embedder:
             stream.input_finished()
             vec = self._extractor.compute(stream)
         return normalize(np.asarray(vec, dtype=np.float32))
+
+
+class SpeechTracker:
+    """Suivi de la parole pendant que l'audio arrive (transcription anticipée).
+
+    Alimenté par morceaux, dans un thread. Silero s'il est disponible (une instance par
+    phrase), sinon l'énergie du signal. Les temps sont en secondes depuis le début de
+    l'audio.
+    """
+
+    _FRAME = 480  # 30 ms, détecteur d'énergie
+
+    def __init__(self, model_path: Path | None = None) -> None:
+        self.position = 0  # échantillons reçus
+        self.speech_samples = 0
+        self.speech_end: int | None = None  # fin de la dernière parole repérée
+        self.in_speech = False
+        # Débuts et fins de parole (en échantillons), pour mesurer la parole après un instant
+        self._spans: list[list[int]] = []
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._vad = None
+        self._peak = 0.0
+        if model_path is not None:
+            import sherpa_onnx
+
+            config = sherpa_onnx.VadModelConfig()
+            config.silero_vad.model = str(model_path)
+            config.silero_vad.threshold = 0.5
+            config.silero_vad.min_silence_duration = 0.1
+            config.silero_vad.min_speech_duration = 0.1
+            config.silero_vad.max_speech_duration = 30
+            config.sample_rate = SAMPLE_RATE
+            config.num_threads = 1
+            self._window = config.silero_vad.window_size
+            self._vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
+
+    @property
+    def position_s(self) -> float:
+        return self.position / SAMPLE_RATE
+
+    @property
+    def speech_s(self) -> float:
+        return self.speech_samples / SAMPLE_RATE
+
+    @property
+    def silence_s(self) -> float:
+        """Silence depuis la fin de la dernière parole (0 pendant la parole ou sans parole)."""
+        if self.in_speech or self.speech_end is None:
+            return 0.0
+        return (self.position - self.speech_end) / SAMPLE_RATE
+
+    def speech_after(self, t_s: float) -> float:
+        """Parole repérée après l'instant `t_s` (en secondes)."""
+        start = int(t_s * SAMPLE_RATE)
+        total = 0
+        for a, b in self._spans:
+            b = self.position if b is None else b
+            total += max(0, b - max(a, start))
+        return total / SAMPLE_RATE
+
+    def feed(self, samples: np.ndarray) -> None:
+        samples = np.asarray(samples, dtype=np.float32)
+        buf = np.concatenate([self._pending, samples])
+        step = self._window if self._vad is not None else self._FRAME
+        n = len(buf) // step * step
+        self._pending = buf[n:]
+        for i in range(0, n, step):
+            frame = buf[i : i + step]
+            if self._vad is not None:
+                self._vad.accept_waveform(frame)
+                speech = self._vad.is_speech_detected()
+                while not self._vad.empty():
+                    self._vad.pop()  # segments inutiles ici : seul l'état compte
+            else:
+                rms = float(np.sqrt((frame**2).mean() + 1e-12))
+                self._peak = max(self._peak, rms)
+                speech = rms > max(0.1 * self._peak, 0.005)
+            self._mark(speech, step)
+
+    def _mark(self, speech: bool, step: int) -> None:
+        start = self.position
+        self.position += step
+        if speech:
+            self.speech_samples += step
+            if not self.in_speech:
+                self._spans.append([start, None])
+            self.in_speech = True
+        elif self.in_speech:
+            self._spans[-1][1] = start
+            self.speech_end = start
+            self.in_speech = False

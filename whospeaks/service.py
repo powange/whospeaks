@@ -67,6 +67,8 @@ class Analysis:
     pendant_enrolement: bool = False
     # Fin de la dernière parole selon le VAD, en secondes depuis le début de l'audio
     fin_parole_s: float | None = None
+    # Voix inconnue pas encore rangée dans un groupe (analyse anticipée non retenue)
+    a_regrouper: bool = False
     horodatage: float = field(default_factory=time.time)
     audio: np.ndarray | None = field(default=None, repr=False)
     emb: np.ndarray | None = field(default=None, repr=False)
@@ -122,10 +124,14 @@ TIMING_FIELDS = ("duree_audio_s", "attente_fin_s", "whisper_s", "identification_
                  "attente_identification_s", "total_s",
                  # retard pris par l'audio de HA pendant la phrase, plus long blocage de la boucle
                  # de WhoSpeaks pendant la phrase, et délai du relais de la fin du flux vers Whisper
-                 "retard_audio_s", "blocage_boucle_s", "relais_whisper_s")
+                 "retard_audio_s", "blocage_boucle_s", "relais_whisper_s",
+                 # temps gagné par la transcription anticipée (Whisper lancé avant la fin du flux)
+                 "gain_anticipation_s",
+                 # entre la réponse de Whisper et l'écriture du texte vers HA
+                 "envoi_s")
 # Temps résumés par médiane et 90e percentile sur 24 h
 TIMING_STATS = ("total_s", "whisper_s", "attente_fin_s", "identification_s", "retard_audio_s",
-                "blocage_boucle_s", "relais_whisper_s")
+                "blocage_boucle_s", "relais_whisper_s", "gain_anticipation_s", "envoi_s")
 
 
 # Whisper entend souvent « Elle éteint… » / « Elle allume… » pour un ordre en début de phrase
@@ -272,18 +278,34 @@ class WhoSpeaks:
         return self.settings
 
     # ------------------------------------------------------------ identification
-    def analyze(self, pcm: bytes, satellite: str | None = None) -> Analysis:
-        """Appelé dans un thread à la fin de chaque phrase (audio 16 kHz mono 16 bits)."""
+    def analyze(self, pcm: bytes, satellite: str | None = None, commit: bool = True) -> Analysis:
+        """Appelé dans un thread à la fin de chaque phrase (audio 16 kHz mono 16 bits).
+
+        `commit=False` (transcription anticipée, peut-être abandonnée) : rien n'est modifié,
+        ni groupes de voix inconnues ni mémoire de reprise ; `commit_analysis` le fait si
+        l'analyse est retenue.
+        """
         audio = pcm16_to_float(pcm)
         if self.vad is None:
             return Analysis("erreur", audio=audio, erreur=self.model_error or "modèle non chargé")
         t0 = time.perf_counter()
         speech, fin = self.vad.speech_and_end(audio)
-        result = self._classify(audio, speech, satellite, t0)
+        result = self._classify(audio, speech, satellite, t0, commit)
         result.fin_parole_s = fin
         return result
 
-    def _classify(self, audio: np.ndarray, speech: np.ndarray, satellite: str | None, t0: float) -> Analysis:
+    def commit_analysis(self, result: Analysis, satellite: str | None) -> Analysis:
+        """Applique les effets d'une analyse faite avec `commit=False`."""
+        with self._lock:
+            if result.a_regrouper and result.emb is not None:
+                result.cluster_id = self._assign_cluster(result.emb)
+            if result.person_id is not None and result.resultat in ("identifie", "enrolement"):
+                self._remember(result, satellite)
+            result.a_regrouper = False
+        return result
+
+    def _classify(self, audio: np.ndarray, speech: np.ndarray, satellite: str | None, t0: float,
+                  commit: bool = True) -> Analysis:
         s = self.settings
         duree = len(speech) / SAMPLE_RATE
         if s["filtre_silence_actif"] and duree < s["silence_max_s"]:
@@ -325,9 +347,11 @@ class WhoSpeaks:
                 self._fill_person(result, match.person_id)
             elif self._is_ignored(emb):
                 result.ignoree = True
-            else:
+            elif commit:
                 result.cluster_id = self._assign_cluster(emb)
-            if result.person_id is not None:
+            else:
+                result.a_regrouper = True
+            if result.person_id is not None and commit:
                 self._remember(result, satellite)
         return result
 
@@ -432,8 +456,9 @@ class WhoSpeaks:
         cur = self.db.execute(
             "INSERT INTO phrases(horodatage, satellite, satellite_entity, transcript, resultat, "
             "personne_id, score, marge, cluster_id, duree_parole, empreinte, modele, etat, "
-            "temps_empreinte_ms, temps_ajoute_ms, " + ", ".join(TIMING_FIELDS) + ") "
-            "VALUES(" + ",".join("?" * (15 + len(TIMING_FIELDS))) + ")",
+            "temps_empreinte_ms, temps_ajoute_ms, anticipation, anticipations_abandonnees, "
+            + ", ".join(TIMING_FIELDS) + ") "
+            "VALUES(" + ",".join("?" * (17 + len(TIMING_FIELDS))) + ")",
             (
                 analysis.horodatage, satellite, satellite_entity, transcript, analysis.resultat,
                 analysis.person_id,
@@ -441,6 +466,7 @@ class WhoSpeaks:
                 None if analysis.emb is None else to_blob(analysis.emb),
                 model if analysis.emb is not None else None, etat,
                 analysis.temps_empreinte_ms, temps_ajoute_ms,
+                (temps or {}).get("anticipation"), (temps or {}).get("anticipations_abandonnees"),
                 *(_round((temps or {}).get(k)) for k in TIMING_FIELDS),
             ),
         )
@@ -763,6 +789,7 @@ class WhoSpeaks:
             f"SELECT p.id, p.horodatage, p.satellite, p.satellite_entity, p.transcript, p.resultat, p.personne_id, "
             f"p.score, p.marge, p.cluster_id, p.duree_parole, p.clip, p.etat, p.empreinte IS NOT NULL "
             f"AS a_empreinte, p.temps_empreinte_ms, p.temps_ajoute_ms, p.transcript_corrige, "
+            f"p.anticipation, p.anticipations_abandonnees, "
             f"{', '.join('p.' + k for k in TIMING_FIELDS)}, pe.nom, c.nom AS cluster_nom "
             f"FROM phrases p LEFT JOIN personnes pe ON pe.id=p.personne_id "
             f"LEFT JOIN clusters c ON c.id=p.cluster_id {where} "

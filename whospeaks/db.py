@@ -111,6 +111,11 @@ MIGRATIONS = [
     ("phrases", "retard_audio_s", "REAL"),
     ("phrases", "blocage_boucle_s", "REAL"),
     ("phrases", "relais_whisper_s", "REAL"),
+    # Transcription anticipée : utilisee | abandonnee | aucune, nombre d'abandons, temps gagné
+    ("phrases", "anticipation", "TEXT"),
+    ("phrases", "anticipations_abandonnees", "INTEGER"),
+    ("phrases", "gain_anticipation_s", "REAL"),
+    ("phrases", "envoi_s", "REAL"),
 ]
 
 

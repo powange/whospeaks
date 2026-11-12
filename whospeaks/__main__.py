@@ -13,6 +13,7 @@ from .config import Config
 from .ha import HomeAssistant
 from .ha_ws import vocabulary_loop
 from .proxy import Proxy, ProxyHandler
+from .transcribe import OpenAITranscriber
 from .service import WhoSpeaks
 from .web import create_app
 
@@ -62,10 +63,16 @@ async def _run(config: Config) -> None:
         _LOGGER.exception("Service d'identification indisponible, proxy en mode transparent")
         service = None
 
+    openai = (OpenAITranscriber(config.upstream_openai_url, config.upstream_openai_model, config.lang)
+              if config.upstream_openai_url else None)
     proxy = Proxy(config.upstream_uri, service, ha, config.lang, config.id_extra_wait,
-                  config.upstream_connect_timeout)
+                  config.upstream_connect_timeout, openai=openai, direct=config.openai_direct)
     server = AsyncServer.from_uri(config.wyoming_uri)
-    _LOGGER.info("Proxy Wyoming sur %s → %s", config.wyoming_uri, config.upstream_uri)
+    if proxy.direct:
+        _LOGGER.info("Proxy Wyoming sur %s → API OpenAI %s (modèle %s)", config.wyoming_uri,
+                     config.upstream_openai_url, config.upstream_openai_model)
+    else:
+        _LOGGER.info("Proxy Wyoming sur %s → %s", config.wyoming_uri, config.upstream_uri)
 
     tasks = [asyncio.create_task(server.run(partial(ProxyHandler, proxy=proxy)), name="wyoming")]
     if service is not None:
@@ -88,6 +95,8 @@ async def _run(config: Config) -> None:
         for task in tasks:
             task.cancel()
         await ha.close()
+        if openai is not None:
+            await openai.close()
 
 
 def main() -> None:

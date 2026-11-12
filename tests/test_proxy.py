@@ -36,8 +36,12 @@ class FakeWhisper:
         self.server = None
         self.delay = WHISPER_DELAY  # temps de « transcription »
         self.transcribes = []  # données des événements transcribe reçus
+        self.active = 0  # connexions ouvertes
+        self.stops = 0  # transcriptions demandées (fins de flux reçues)
+        self.sent_at = []  # instants (perf_counter) des réponses envoyées
 
     async def handle(self, reader, writer):
+        self.active += 1
         try:
             while True:
                 event = await async_read_event(reader)
@@ -55,10 +59,15 @@ class FakeWhisper:
                 elif AudioChunk.is_type(event.type):
                     self.received_bytes += len(event.payload or b"")
                 elif AudioStop.is_type(event.type):
+                    self.stops += 1
                     await asyncio.sleep(self.delay)
                     text = self.texts.pop(0) if self.texts else "fin"
+                    self.sent_at.append(time.perf_counter())
                     await async_write_event(Transcript(text=text, language="fr").event(), writer)
+        except (ConnectionError, OSError):
+            pass  # client parti (transcription abandonnée)
         finally:
+            self.active -= 1
             writer.close()
 
     async def start(self):
