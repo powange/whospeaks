@@ -55,21 +55,19 @@ class HomeAssistant:
             await self._client.aclose()
             self._client = None
 
-    async def publish(self, payload: dict, timeout: float | None = None) -> bool:
-        """Capteur + événement en parallèle ; ne lève jamais d'exception."""
+    async def publish(self, payload: dict, timeout: float | None = None, event: bool = True) -> bool:
+        """Capteur (+ événement si `event`) en parallèle ; ne lève jamais d'exception."""
         if not self.enabled:
             return False
         event_data = {"interlocuteur": payload["state"], **payload["attributes"]}
         event_data.pop("friendly_name", None)
         event_data.pop("icon", None)
+        posts = [self._post(f"/api/states/{self.sensor}", payload)]
+        if event:
+            posts.append(self._post(f"/api/events/{self.event}", event_data))
         try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    self._post(f"/api/states/{self.sensor}", payload),
-                    self._post(f"/api/events/{self.event}", event_data),
-                ),
-                timeout=timeout if timeout is not None else self.timeout,
-            )
+            await asyncio.wait_for(asyncio.gather(*posts),
+                                   timeout=timeout if timeout is not None else self.timeout)
             self.last_error = None
             return True
         except Exception as err:  # noqa: BLE001

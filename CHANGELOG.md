@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+### Latence
+
+- **Lecture de l'audio de HA sans blocage.** Chaque morceau est mis en file vers Whisper, et une tâche à part l'écrit au rythme de Whisper : un Whisper ou un relais lent ne ralentit plus la lecture de HA, ni sa détection de fin de parole. La conversion audio passe dans le thread d'analyse.
+- **`TCP_NODELAY`** sur la connexion de HA et sur celle vers Whisper.
+- **Texte envoyé sans attendre HA.** Le capteur `sensor.jarvis_interlocuteur` est publié dès l'identification, pendant que Whisper transcrit. À l'arrivée du texte, il n'y a plus d'attente de HA (jusqu'à 0,3 s auparavant). L'événement `jarvis_interlocuteur` (avec le texte) part juste après le texte.
+- La page web n'interroge plus la base dans la boucle du proxy (`/api/etat`, `/api/vocabulaire`).
+- Calcul du prompt linéaire (il grossissait au carré du nombre de termes).
+
+### Mesures
+
+- Nouveaux temps par phrase : `retard_audio_s` (retard pris par l'audio de HA, horloge de l'audio contre horloge murale), `blocage_boucle_s` (plus long blocage de WhoSpeaks pendant la phrase), `relais_whisper_s` (file vers Whisper). `whisper_s` est désormais le temps propre de Whisper, à partir de l'envoi effectif de la fin du flux. Les trois apparaissent dans le détail, dans les médianes sur 24 h et dans les capteurs de temps.
+- Onglet Réglages : ce que Whisper annonce (programme, modèles, version) ; `GET /api/whisper`.
+- README : comment lire ces mesures, et comment accélérer `whisper-server` (modèle turbo, faisceau, repli en température).
+
+### Vocabulaire
+
+- Mots mal compris ajoutés d'office : « Elle éteint » → « éteins », « Elle allume » → « allume » (retirables, pas remis ensuite).
+- Détection de la recopie du prompt plus stricte : une vraie commande qui contient des termes du prompt (« Allume l'imprimante 3D ») n'est plus prise pour une recopie.
+
 ## 0.6.0
 
 ### Ajouts

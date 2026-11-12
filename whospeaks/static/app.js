@@ -192,8 +192,11 @@ const openDetails = new Set();
 const TIMINGS = [
   ["duree_audio_s", "Audio reçu de HA"],
   ["duree_parole", "Parole (VAD)"],
+  ["retard_audio_s", "Retard pris par l'audio de HA pendant la phrase (horloge de l'audio / horloge murale)"],
+  ["blocage_boucle_s", "Plus long blocage de WhoSpeaks pendant la phrase"],
   ["attente_fin_s", "Attente fin de parole → fin du flux (détection de HA)"],
-  ["whisper_s", "Whisper (fin du flux → texte)"],
+  ["relais_whisper_s", "Relais de la fin du flux vers Whisper"],
+  ["whisper_s", "Whisper (fin du flux reçue → texte)"],
   ["identification_s", "Identification de la voix"],
   ["attente_identification_s", "Attente de l'identification après Whisper"],
   ["total_s", "Total (premier paquet audio → texte renvoyé à HA)"],
@@ -230,7 +233,7 @@ function timingStats(stats) {
   const pair = (v) => v ? `${v.mediane.toFixed(1)} / ${v.p90.toFixed(1)} s` : "—";
   return h("div", { class: "stats muted" }, "Temps sur 24 h (médiane / 90 %) : ",
     rows.map((x) => h("span", { class: "badge none", title: `${x.phrases} phrase(s)` },
-      `${x.satellite ?? "?"} : total ${pair(x.total_s)} · Whisper ${pair(x.whisper_s)} · fin de parole ${pair(x.attente_fin_s)}`)));
+      `${x.satellite ?? "?"} : total ${pair(x.total_s)} · Whisper ${pair(x.whisper_s)} · fin de parole ${pair(x.attente_fin_s)} · retard de l'audio ${pair(x.retard_audio_s)}`)));
 }
 
 // --- Vocabulaire ---
@@ -513,7 +516,8 @@ const FIELDS = [
 
 async function renderReglages() {
   const root = document.getElementById("reglages");
-  const [cfg, modeles] = await Promise.all([api("GET", "/api/reglages"), api("GET", "/api/modeles")]);
+  const [cfg, modeles, whisper] = await Promise.all([api("GET", "/api/reglages"), api("GET", "/api/modeles"),
+    api("GET", "/api/whisper").catch(() => null)]);
   const v = cfg.valeurs;
   const inputs = {};
   const fields = FIELDS.map(([key, label, type, opt, bounds]) => {
@@ -560,6 +564,7 @@ async function renderReglages() {
     h("div", { class: "card" }, h("h2", {}, "Identification et regroupement"), h("div", { class: "form-grid" }, ...fields,
       h("label", {}, "Modèle d'empreinte", modele)),
       h("div", { class: "toolbar", style: "margin-top:12px" }, h("button", { class: "primary", onclick: save }, "Enregistrer"))),
+    whisperCard(whisper),
     h("div", { class: "card" }, h("h2", {}, "Calibrage"),
       h("p", { class: "muted" }, "Compare les phrases d'une même personne et de personnes différentes, puis propose seuil et marge (validation croisée sur les échantillons)."),
       h("button", { onclick: () => runCalibration(calib) }, "Lancer le calibrage"), calib),
@@ -571,6 +576,23 @@ async function renderReglages() {
         h("button", { onclick: () => act(() => api("POST", "/api/empreintes/recalculer"), "Recalcul lancé") }, "Recalculer les empreintes"),
         h("button", { onclick: () => act(async () => { const r = await api("POST", "/api/retention"); toast(`${r.supprimes} extrait(s) supprimé(s)`); }) }, "Appliquer la rétention")),
       taskInfo()));
+}
+
+// Ce que Whisper annonce dans son describe (Wyoming ne transmet ni beam_size ni compute type)
+function whisperCard(w) {
+  if (!w) return null;
+  const progs = w.programmes.length ? w.programmes.map((p) => h("div", {},
+    h("div", {}, h("strong", {}, p.nom), ` — ${p.description || ""}`, p.version ? ` (v${p.version})` : "",
+      p.attribution ? h("span", { class: "muted" }, ` · ${p.attribution}`) : null,
+      h("span", { class: "muted" }, p.streaming ? " · texte en flux" : " · texte à la fin")),
+    h("table", {}, p.modeles.map((m) => h("tr", {}, h("td", {}, m.nom), h("td", { class: "muted" }, m.description || ""),
+      h("td", { class: "muted" }, (m.langues || []).slice(0, 6).join(", ") + ((m.langues || []).length > 6 ? "…" : "")))))))
+    : [h("p", { class: "muted" }, "Whisper n'a pas répondu à la demande d'informations.")];
+  return h("div", { class: "card" }, h("h2", {}, "Whisper (amont)"),
+    h("p", { class: "muted" }, `${w.amont}${w.lu_le ? ` · lu le ${fmtDate(w.lu_le)}` : ""}`), ...progs,
+    h("p", { class: "muted" }, "Le protocole Wyoming n'annonce ni la taille de faisceau (beam size) ni le type de calcul : " +
+      "les vérifier dans la commande de whisper-server (voir le README, « Accélérer Whisper »)."),
+    h("button", { onclick: () => act(() => api("GET", "/api/whisper?rafraichir=true"), "Informations relues") }, "Relire"));
 }
 
 function taskInfo() {

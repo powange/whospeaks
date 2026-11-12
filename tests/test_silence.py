@@ -140,7 +140,9 @@ async def test_merci_alone_is_emptied(service, whisper):  # noqa: F811
     w.texts = ["Merci."]
     event, _, calls = await run_one(service, uri, pcm(PIERRE, seconds=1.5), None)
     assert event.data["text"] == "" and event.data["ignored"] == "hallucination"
-    assert calls == []
+    # Capteur publié dès l'identification (avant de savoir que le texte est inventé),
+    # mais pas d'événement jarvis_interlocuteur
+    assert [p for _, p, _ in calls] == ["/api/states/sensor.jarvis_interlocuteur"]
     row = service.list_phrases(1)[0]
     assert row["resultat"] == "ignoree_hallucination" and row["transcript"] == "Merci."
 
@@ -157,7 +159,8 @@ async def test_filter_disabled_keeps_current_behaviour(service, whisper):  # noq
     w, uri = whisper
     w.texts = [" ...", "Merci."]
     event, _, calls = await run_one(service, uri, silence(), None)
-    assert event.data["text"] == " ..." and len(calls) == 2
+    assert event.data["text"] == " ..."
+    assert {p for _, p, _ in calls} == {"/api/states/sensor.jarvis_interlocuteur", "/api/events/jarvis_interlocuteur"}
     event, _, _ = await run_one(service, uri, pcm(PIERRE, seconds=1.5), None)
     assert event.data["text"] == "Merci."
 

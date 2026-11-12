@@ -94,30 +94,37 @@ def build_prompt(terms: list[tuple[str, str]], max_tokens: int = DEFAULT_MAX_TOK
     une vraie commande (« allume l'imprimante 3D ») n'est pas prise pour une recopie du prompt.
     """
     kept: list[str] = []
+    length = 1  # point final ; longueur tenue à jour plutôt que de reconstruire le texte
     for term, _ in terms:
-        candidate = ", ".join([*kept, term]) + "."
-        if estimate_tokens(candidate) > max_tokens:
+        candidate = length + len(term) + (2 if kept else 0)  # « , » entre deux termes
+        if estimate_tokens("x" * candidate) > max_tokens:
             continue  # trop long : on tente les termes suivants, plus courts
         kept.append(term)
+        length = candidate
     return (", ".join(kept) + "." if kept else ""), kept
 
 
 def is_prompt_copy(text: str | None, prompt: str, terms: list[str]) -> bool:
     """Whisper a-t-il recopié le prompt (tel quel ou presque) au lieu de transcrire ?
 
-    Il faut un texte d'au moins 15 caractères, couvert à 90 % par des morceaux du prompt
-    (de 4 caractères ou plus), et qui reprend au moins 3 termes du prompt.
+    Une recopie garde la forme de liste du prompt : au moins 3 morceaux (séparés par la
+    ponctuation) qui sont exactement des termes du prompt, et au moins 80 % des morceaux.
+    Sans ponctuation : texte fait à 95 % de morceaux du prompt, avec au moins 5 termes.
+    Une vraie commande (« Allume l'imprimante 3D », même si « allume » est dans le prompt)
+    ne passe aucun des deux critères.
     """
     t = normalize_text(text)
     p = normalize_text(prompt)
     if len(t) < 15 or not p:
         return False
+    keys = {k for k in (normalize_text(term) for term in terms) if k}
+    segments = [k for k in (normalize_text(seg) for seg in re.split(r"[,.;:!?…]+", text or "")) if k]
+    hits = sum(1 for seg in segments if seg in keys)
+    if hits >= 3 and hits >= 0.8 * len(segments):
+        return True
     matcher = difflib.SequenceMatcher(None, t, p, autojunk=False)
     covered = sum(b.size for b in matcher.get_matching_blocks() if b.size >= 4)
-    if covered < 0.9 * len(t):
-        return False
-    found = sum(1 for term in terms if (k := normalize_text(term)) and k in t)
-    return found >= 3
+    return covered >= 0.95 * len(t) and sum(1 for k in keys if k in t) >= 5
 
 
 def _strip_elision(word: str) -> str:

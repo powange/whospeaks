@@ -45,7 +45,8 @@ async def test_enrolement_is_silent_and_still_counts(service, whisper):  # noqa:
     # Ensuite, Jarvis répond de nouveau normalement.
     event, _, calls = await run_one(service, uri, pcm(PIERRE, LONG, seed=4), None)
     assert event.data["text"] == "Allume la lumière" and event.data["speaker"] == "Pierre"
-    assert len(calls) == 2
+    await asyncio.sleep(0.05)
+    assert {p for _, p, _ in calls} == {"/api/states/sensor.jarvis_interlocuteur", "/api/events/jarvis_interlocuteur"}
 
 
 async def test_silence_during_enrolement_stays_silence(service, whisper):  # noqa: F811

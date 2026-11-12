@@ -135,14 +135,17 @@ async def test_transparency_and_ha_order(service, whisper):
     server, port = await start_proxy(proxy)
     audio = pcm(180.0, seconds=2.0)
     for expected in TEXTS:
+        before = len(fake.calls)
         event, _, t_recv = await transcribe(port, audio)
         assert event.data["text"] == expected  # texte strictement identique
         assert event.data["text"].encode() == expected.encode()
         assert event.data["speaker"] == "inconnu"
-        ha_times = [t for t, path, _ in fake.calls[-2:]]
-        assert {p for _, p, _ in fake.calls[-2:]} == {
-            "/api/states/sensor.jarvis_interlocuteur", "/api/events/jarvis_interlocuteur"}
-        assert max(ha_times) < t_recv  # HA prévenu avant le renvoi du texte
+        await asyncio.sleep(0.05)  # événement publié juste après le texte
+        calls = fake.calls[before:]
+        sensor = [t for t, p, _ in calls if p == "/api/states/sensor.jarvis_interlocuteur"]
+        events = [t for t, p, _ in calls if p == "/api/events/jarvis_interlocuteur"]
+        assert sensor and sensor[0] < t_recv  # capteur à jour avant le renvoi du texte
+        assert len(events) == 1  # événement jarvis_interlocuteur (après le texte)
     assert w.received_bytes == len(audio) * len(TEXTS)
     await asyncio.sleep(0.3)  # enregistrement en arrière-plan
     assert len(service.list_phrases(100)) == 20

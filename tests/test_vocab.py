@@ -14,7 +14,8 @@ from whospeaks.config import Config
 from whospeaks.ha import HomeAssistant
 from whospeaks.ha_ws import HaWsError, fetch_vocabulary, ws_url
 from whospeaks.proxy import Proxy
-from whospeaks.service import WhoSpeaks
+from whospeaks.service import INITIAL_CORRECTIONS, WhoSpeaks
+from whospeaks.vocab import is_prompt_copy
 from whospeaks.vocab import build_prompt, build_terms, estimate_tokens, parse_ha
 from whospeaks.web import create_app
 
@@ -37,6 +38,12 @@ STATES = [
 ]
 AREAS = [{"area_id": "salon", "name": "Salon", "aliases": ["Séjour"]}]
 FLOORS = [{"floor_id": "etage", "name": "Étage", "aliases": []}]
+
+
+def clear_seeds(service):
+    """Retire les mots mal compris ajoutés d'office, pour tester l'ordre des autres termes."""
+    for faux, vrai in INITIAL_CORRECTIONS:
+        service.delete_correction(faux, vrai)
 
 
 def ha_vocab():
@@ -73,6 +80,7 @@ def test_prompt_truncated_with_corrections_first():
 
 # --- Service : prompt, cache, corrections ------------------------------------------
 def test_service_prompt_and_cache(service, tmp_path):
+    clear_seeds(service)
     service.create_person("Pierre")
     service.update_settings({"mots_en_plus": ["Jarvis", "Ambilight"]})
     service.set_ha_vocabulary(ha_vocab())
@@ -85,6 +93,7 @@ def test_service_prompt_and_cache(service, tmp_path):
 
 
 def test_correction_adds_word_first(service):
+    clear_seeds(service)
     service.set_ha_vocabulary(ha_vocab())
     a = service.analyze(pcm(PIERRE))
     pid = service.record(a, "Allume l'impliment 3D et le sécheur de bobine.")
@@ -125,6 +134,7 @@ def proxy_with(service, uri, fake=None):
 
 async def test_terms_sent_upstream(service, whisper):  # noqa: F811
     w, uri = whisper
+    clear_seeds(service)
     service.update_settings({"mots_en_plus": ["Jarvis", "OctoPi"]})
     server, port = await start_proxy(Proxy(uri, service, None))
     await transcribe(port, pcm(PIERRE))
@@ -243,3 +253,27 @@ async def test_fetch_vocabulary_errors():
 def test_ws_url():
     assert ws_url("http://192.168.0.201:8123/") == "ws://192.168.0.201:8123/api/websocket"
     assert ws_url("https://ha.example") == "wss://ha.example/api/websocket"
+
+
+def test_initial_corrections_once(service):
+    assert {(c["faux"], c["vrai"]) for c in service.list_corrections()} == set(INITIAL_CORRECTIONS)
+    assert set(service.prompt_terms[:2]) == {"éteins", "allume"}
+    clear_seeds(service)
+    again = WhoSpeaks(Config(data_dir=service.config.data_dir))  # retirées : pas remises
+    assert again.list_corrections() == []
+    again.db.close()
+
+
+@pytest.mark.parametrize("text, copy", [
+    ("Allume l'imprimante 3D", False),
+    ("Allume l'imprimante 3D et le sécheur de bobine", False),
+    ("Éteins la télé, l'Ambilight et la lampe du salon", False),
+    ("Imprimante 3D, sécheur de bobine, Ambilight, store chambre 1.", True),
+    ("éteins, allume, Imprimante 3D, Sécheur de bobine, Ambilight", True),
+    ("Ambilight", False),
+])
+def test_prompt_copy_with_verbs_in_prompt(text, copy):
+    terms = ["éteins", "allume", "Jarvis", "Imprimante", "Imprimante 3D", "sécheur de bobine",
+             "Ambilight", "store chambre 1", "lampe du salon", "télé"]
+    prompt, kept = build_prompt([(t, "entite") for t in terms])
+    assert is_prompt_copy(text, prompt, kept) is copy

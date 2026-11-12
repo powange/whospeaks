@@ -64,7 +64,7 @@ class EnrolIn(BaseModel):
     duree_max: float = 900
 
 
-def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
+def create_app(service: WhoSpeaks, config: Config, proxy=None) -> FastAPI:
     app = FastAPI(title="WhoSpeaks", version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     frame_origins = " ".join(["'self'", *([config.ha_url] if config.ha_url else []), *config.frame_ancestors])
@@ -121,7 +121,19 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
     @app.get("/api/etat", dependencies=[api])
     async def etat():
         commit = os.environ.get("WHOSPEAKS_COMMIT", "")[:7]
-        return service.status() | {"version": __version__, "commit": commit, "ha_url": config.ha_url}
+        # Hors de la boucle : les comptages sur le journal ne doivent pas retarder la lecture
+        # de l'audio de HA par le proxy, dans la même boucle
+        status = await run(service.status)
+        return status | {"version": __version__, "commit": commit, "ha_url": config.ha_url}
+
+    @app.get("/api/whisper", dependencies=[api])
+    async def whisper(rafraichir: bool = False):
+        """Ce que Whisper (l'amont) annonce : programme, modèles, version."""
+        if proxy is None:
+            raise HTTPException(503, "Proxy indisponible")
+        if rafraichir or proxy.upstream_info is None:
+            await proxy.get_info()
+        return proxy.upstream_summary()
 
     @app.get("/api/modeles", dependencies=[api])
     async def modeles():
@@ -146,7 +158,7 @@ def create_app(service: WhoSpeaks, config: Config) -> FastAPI:
 
     @app.get("/api/vocabulaire", dependencies=[api])
     async def vocabulaire():
-        return service.vocabulary_info()
+        return await run(service.vocabulary_info)
 
     @app.get("/api/vocabulaire/prompt", dependencies=[api])
     async def vocabulaire_prompt():

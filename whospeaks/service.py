@@ -119,9 +119,17 @@ class Enrolement:
 # parole de HA), Whisper, identification et attente de l'identification après Whisper,
 # total du premier paquet audio au texte renvoyé à HA
 TIMING_FIELDS = ("duree_audio_s", "attente_fin_s", "whisper_s", "identification_s",
-                 "attente_identification_s", "total_s")
+                 "attente_identification_s", "total_s",
+                 # retard pris par l'audio de HA pendant la phrase, plus long blocage de la boucle
+                 # de WhoSpeaks pendant la phrase, et délai du relais de la fin du flux vers Whisper
+                 "retard_audio_s", "blocage_boucle_s", "relais_whisper_s")
 # Temps résumés par médiane et 90e percentile sur 24 h
-TIMING_STATS = ("total_s", "whisper_s", "attente_fin_s", "identification_s")
+TIMING_STATS = ("total_s", "whisper_s", "attente_fin_s", "identification_s", "retard_audio_s",
+                "blocage_boucle_s", "relais_whisper_s")
+
+
+# Whisper entend souvent « Elle éteint… » / « Elle allume… » pour un ordre en début de phrase
+INITIAL_CORRECTIONS = (("Elle éteint", "éteins"), ("Elle allume", "allume"))
 
 
 def _round(value: float | None) -> float | None:
@@ -172,6 +180,7 @@ class WhoSpeaks:
         self._prompt = ""
         self._prompt_terms: list[str] = []
         self._load_vocab_cache()
+        self._seed_corrections()
         self.rebuild_vocabulary()
 
     # ------------------------------------------------------------------ modèles
@@ -1279,6 +1288,18 @@ class WhoSpeaks:
             pass
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Vocabulaire HA en cache illisible : %s", err)
+
+    def _seed_corrections(self) -> None:
+        """Erreurs connues de Whisper en français, ajoutées une seule fois (retirables)."""
+        if self.db.one("SELECT 1 FROM reglages WHERE cle='corrections_initiales'"):
+            return
+        now = time.time()
+        with self.db.tx() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO corrections_mots(faux, vrai, nombre, derniere) VALUES(?, ?, 1, ?)",
+                [(faux, vrai, now) for faux, vrai in INITIAL_CORRECTIONS],
+            )
+            conn.execute("INSERT OR REPLACE INTO reglages(cle, valeur) VALUES('corrections_initiales', 'true')")
 
     def set_ha_vocabulary(self, data: dict) -> None:
         """Nouveau relevé de HA (entités partagées, pièces, étages)."""

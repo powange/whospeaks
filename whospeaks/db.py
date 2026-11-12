@@ -108,6 +108,9 @@ MIGRATIONS = [
     ("phrases", "identification_s", "REAL"),
     ("phrases", "attente_identification_s", "REAL"),
     ("phrases", "total_s", "REAL"),
+    ("phrases", "retard_audio_s", "REAL"),
+    ("phrases", "blocage_boucle_s", "REAL"),
+    ("phrases", "relais_whisper_s", "REAL"),
 ]
 
 

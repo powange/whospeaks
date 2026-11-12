@@ -73,7 +73,9 @@ async def _run(config: Config) -> None:
         if ha.enabled:
             tasks.append(asyncio.create_task(vocabulary_loop(service, config.ha_url, config.ha_token),
                                              name="vocabulaire"))
-        app = create_app(service, config)
+        app = create_app(service, config, proxy)
+        # Infos de Whisper pour la page (sans attendre la première demande de HA)
+        proxy.keep(asyncio.create_task(proxy.get_info(), name="whospeaks describe"))
         web = uvicorn.Server(web_server_config(app, config))
         tasks.append(asyncio.create_task(web.serve(), name="web"))
         _LOGGER.info("Page web sur http://%s:%d", config.web_host, config.web_port)

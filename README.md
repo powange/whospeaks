@@ -256,6 +256,33 @@ Pour chaque phrase, le journal enregistre, en secondes :
 | `identification_s` | identification de la voix (VAD et empreinte, en parallèle de Whisper) |
 | `attente_identification_s` | attente de l'identification après l'arrivée du texte (au plus `ID_EXTRA_WAIT`) |
 | `total_s` | entre le premier paquet audio et le texte renvoyé à HA |
+| `retard_audio_s` | retard pris par l'audio de HA pendant la phrase : écart entre l'horloge de l'audio (ce que HA a envoyé) et l'horloge murale, entre le moment le mieux calé et la fin |
+| `blocage_boucle_s` | plus long blocage de WhoSpeaks pendant la phrase (lecture de HA retardée d'autant) |
+| `relais_whisper_s` | entre la fin du flux reçue de HA et son envoi à Whisper (file d'attente du relais) |
+
+**Lire ces mesures.**
+- Si `retard_audio_s` grandit alors que `blocage_boucle_s` reste à quelques millisecondes, c'est HA (ou le satellite) qui envoie l'audio plus lentement que le temps réel, pas WhoSpeaks. HA détecte alors la fin de parole d'autant plus tard.
+- `whisper_s` est le temps propre de Whisper : de l'arrivée de la fin du flux chez Whisper jusqu'au texte.
+- Pour comparer, passer le pipeline sur `stt.whisper_gpu` (port 10301, sans WhoSpeaks) et regarder l'écart entre l'horodatage de `stt-vad-end` et son heure dans le debug du pipeline. S'il reste de 1 s, le retard ne vient pas de WhoSpeaks.
+
+### Ce que WhoSpeaks fait pour ne rien retarder
+
+- **Lecture de HA sans blocage.** Chaque morceau d'audio est seulement mis en file vers Whisper et noté. Une tâche à part écrit vers Whisper, au rythme qu'il accepte : un Whisper lent ne ralentit pas la lecture de HA, donc pas sa détection de fin de parole. La conversion, le VAD et l'empreinte tournent dans un thread, à la fin de la phrase ; sherpa-onnx y libère Python (moins de 5 ms de blocage mesuré). Le journal, l'écriture du WAV et les appels à HA tournent dans d'autres tâches ou threads. La page web ne fait plus de requête à la base dans la boucle du proxy.
+- **Relais en flux.** Chaque morceau part vers Whisper dès sa réception, avec `TCP_NODELAY` sur les deux connexions.
+- **Texte envoyé sans attendre.** Le capteur `sensor.jarvis_interlocuteur` est publié dès que la voix est identifiée, pendant que Whisper transcrit. À l'arrivée du texte, WhoSpeaks attend l'identification au plus `ID_EXTRA_WAIT` (0,15 s), et pas du tout HA. L'événement `jarvis_interlocuteur` (avec le texte) part juste après le texte.
+  - Une phrase dont le texte est ensuite jugé inventé (« Merci. ») a donc déjà mis le capteur à jour, sans événement.
+  - Si l'identification n'est pas prête, le texte part sans locuteur, et le capteur suit dès qu'elle l'est.
+
+### Accélérer Whisper
+
+L'onglet Réglages affiche ce que Whisper annonce (programme, modèles, version). Le protocole Wyoming ne transmet ni la taille de faisceau, ni le type de calcul, ni le fichier de modèle : il faut les vérifier dans la commande qui lance `whisper-server` (whisper.cpp) sur le GEEKOM.
+- **Modèle** : c'est le levier principal. `large-v3-turbo` (ou `large-v3-turbo-q5_0`, 547 Mo) a un décodeur de 4 couches au lieu de 32. Il est plusieurs fois plus rapide que `large-v3`, pour une qualité très proche en français. Le télécharger avec `models/download-ggml-model.sh large-v3-turbo`, puis le passer avec `-m`.
+- **Faisceau** : `whisper-server` décode en glouton par défaut (`-bs -1`). Si la commande contient `-bs 5` (ou plus), la retirer ou passer `-bs 1` : la recherche en faisceau multiplie le temps de décodage.
+- **Repli en température** : sans `-nf`, une phrase difficile peut être décodée plusieurs fois. `-nf` (`--no-fallback`) l'évite.
+- **Flash attention** : `-fa`, si la version et le pilote Vulkan le permettent.
+- **Prompt** : `whisper-server` accepte aussi `--prompt`, et le champ `prompt` à chaque requête, que `wyoming_openai` remplit avec `STT_PROMPT` (voir « Vocabulaire de la maison »).
+
+Pour vérifier le gain : regarder `whisper_s` dans le journal, ou `sensor.whospeaks_temps_whisper`, avant et après.
 
 - **Journal** : le temps total et celui de Whisper sont affichés sur chaque phrase, et le détail ⓘ donne les sept mesures. Au-dessus de la liste, une ligne donne, par satellite, la médiane et le 90e percentile sur 24 h du total, de Whisper et de l'attente de fin de parole. API : `GET /api/temps`.
 - **Capteurs HA** : `sensor.whospeaks_temps_whisper` et `sensor.whospeaks_temps_total` (en secondes, avec toutes les mesures en attributs), publiés après chaque phrase sans retarder la réponse.
